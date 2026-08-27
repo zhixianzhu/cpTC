@@ -1,0 +1,15 @@
+# Build outputs
+Release_opt/
+*.o
+*.a
+*.so
+
+# Tensors (large, not tracked; see docs/tensors.md)
+*.tns
+*.tns.gz
+tensors/
+
+# Misc
+*.log
+*.nsys-rep
+*.sqlite
