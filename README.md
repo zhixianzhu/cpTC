@@ -5,6 +5,16 @@ decomposition on NVIDIA GPUs by splitting the tensor into dense blocks
 (processed by Tensor Cores via WMMA TF32) and residual values (processed
 by FP64 CUDA cores), with a fill-rate-adaptive path-selection rule.
 
+## Supported GPUs
+
+Works on any sm_89 (Ada) GPU: RTX 4060/4060 Ti/4070/4080/4090, RTX
+4000 Ada/5000 Ada/6000 Ada. Runtime device adaptation:
+
+- The fill-rate threshold (0.11 @ 24 SM) is auto-scaled by SM count
+  (e.g., ~0.08 on RTX 4090's 128 SMs).
+- The auto-balance rates in partitioning are scaled by SM count.
+- Build with `-gencode arch=compute_89,code=sm_89` (already set).
+
 ## Features
 
 - Sparse MTTKRP kernel: row-sorted views, register-cached factor rows,
