@@ -15,7 +15,19 @@
 #include <iostream>
 #include <vector>
 
+// 分阶段计时（环境变量 ALS_PROFILE=1 开启）
 static const bool g_als_profile = (std::getenv("ALS_PROFILE") != nullptr);
+
+// ============================================================
+// ALS_FUSED=1    单 grid 负载均衡融合路径：稠密 WMMA 块与
+//                稀疏 FP64 块在同一 kernel 内交错调度
+//                （真正的 TensorCore/CUDACore 并发；当前 R==32）
+// ALS_NO_DENSE=1 / ALS_NO_SPARSE=1
+//                分量微基准（跳过经典双流路径的一侧）
+// ============================================================
+static const bool g_use_fused   = (std::getenv("ALS_FUSED")   != nullptr);
+static const bool g_skip_dense  = (std::getenv("ALS_NO_DENSE")  != nullptr);
+static const bool g_skip_sparse = (std::getenv("ALS_NO_SPARSE") != nullptr);
 
 __global__ void check_nan_inf_kernel(const double* data, size_t size, int* d_has_bad);
 __global__ void compute_column_norms_kernel(const double* factor, int rows, int R, double* d_norms);
@@ -25,6 +37,7 @@ __global__ void compute_lambda_kernel(const double* na, const double* nb, const 
 __global__ void divide_factor_kernel(double* factor, int rows, int R, const double* d_norms);
 __global__ void normalize_with_scale_kernel(double* factor, int rows, int R,
                                             const double* norms);
+
 
 #if ENABLE_NAN_CHECK
 __global__ void check_nan_inf_kernel(const double* data, size_t size, int* d_has_bad)
@@ -137,6 +150,12 @@ static void normalize_factor(double* d_factor, size_t rows, int R,
     CHECK_CUDA(cudaDeviceSynchronize());
 }
 
+
+// ============================================================
+// SVD-ALS 辅助内核
+// ============================================================
+
+// 列方向内积：out[r] = sum_i U[i*R+r] * V[i*R+r]
 __global__ void column_dot_kernel(
     const double* __restrict__ U,
     const double* __restrict__ V,
@@ -156,6 +175,7 @@ __global__ void column_dot_kernel(
         acc += U[p] * V[p];
     }
 
+    // block reduce
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
     {
@@ -185,6 +205,7 @@ __global__ void column_dot_kernel(
     }
 }
 
+// 向量求和：out = sum(x[0..n))
 __global__ void vecsum_kernel(
     const double* __restrict__ x,
     size_t n,
@@ -226,12 +247,14 @@ __global__ void vecsum_kernel(
     }
 }
 
+// 填充常量
 __global__ void fill_value_kernel(double* x, size_t n, double val)
 {
     size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) x[i] = val;
 }
 
+// 真实列范数（不截断）：norms[r] = ||factor[:,r]||
 __global__ void column_norms_kernel2(
     const double* __restrict__ factor,
     int rows,
@@ -279,6 +302,9 @@ __global__ void column_norms_kernel2(
     }
 }
 
+// 归一化因子列 + λ 吸收：
+//   factor[:,r] /= norms[r]   （norms < eps 时置 0）
+//   lambda[r]   *= norms[r]   （norms < eps 时置 0）
 __global__ void normalize_absorb_lambda_kernel(
     double* __restrict__ factor,
     int rows,
@@ -315,6 +341,7 @@ __global__ void normalize_absorb_lambda_kernel(
     }
 }
 
+// 求解结果除以 λ：ALS 目标含 λ，A_corrected = A_sol / lambda
 __global__ void factor_divide_lambda_kernel(
     double* __restrict__ factor,
     int rows,
@@ -344,7 +371,7 @@ void execute_als_decomposition(
     int max_iters,
     double lambda_reg)
 {
-    (void)lambda_reg;
+    (void)lambda_reg;   // SVD 伪逆求解无需正则化
 
     if (R <= 0 || max_iters <= 0 ||
         !d_A || !d_B || !d_C || !d_lambda_out) {
@@ -377,6 +404,7 @@ void execute_als_decomposition(
     CHECK_CUDA(cudaStreamCreateWithFlags(&sparse_stream, cudaStreamNonBlocking));
     CHECK_CUDA(cudaEventCreateWithFlags(&zero_event, cudaEventDisableTiming));
 
+    // 因子更新（默认流）完成信号：dense/sparse 流需等待后读取因子
     cudaEvent_t factor_event = nullptr;
     CHECK_CUDA(cudaEventCreateWithFlags(&factor_event, cudaEventDisableTiming));
     CHECK_CUDA(cudaEventRecord(factor_event));
@@ -390,20 +418,24 @@ void execute_als_decomposition(
     CHECK_CUDA(cudaMalloc(&d_FtF, RR * sizeof(double)));
     CHECK_CUDA(cudaMalloc(&d_FtV, max_dim * static_cast<size_t>(R) * sizeof(double)));
 
+    // CP 权重 lambda（每轮归一化时吸收列范数）
     CHECK_CUDA(cudaMemset(d_lambda_out, 0, R * sizeof(double)));
     fill_value_kernel<<<(R + 255) / 256, 256>>>(
         d_lambda_out, R, 1.0);
     CHECK_CUDA(cudaGetLastError());
 
+    // SVD 求解工作区
     SVDWorkspace svd_ws;
     init_svd_workspace(svd_ws, R);
 
+    // gram-fit 临时缓冲
     double *d_work_r = nullptr, *d_model = nullptr, *d_scalar = nullptr;
 
     CHECK_CUDA(cudaMalloc(&d_work_r, R * sizeof(double)));
     CHECK_CUDA(cudaMalloc(&d_model, RR * sizeof(double)));
     CHECK_CUDA(cudaMalloc(&d_scalar, sizeof(double)));
 
+    // 张量 X 的 Frobenius 范数平方（一次性）
     double h_X_norm_sq = 0.0, h_res_ignored = 0.0;
 
     compute_residual_and_norm_sq(
@@ -438,10 +470,17 @@ void execute_als_decomposition(
 
     CHECK_CUDA(cudaEventRecord(total_start));
 
+    // 每轮执行一个模式的更新：求解 -> 除以 λ -> 归一化（λ 吸收）-> 更新 gram
+    //
+    // 每模式立即归一化，保证后续模式的 MTTKRP/求解输入始终是单位因子
+    // （gram diag = 1，SVD 条件数最佳）。BLCO 同款。
+    //
+    // 求解结果先除以 λ：ALS 目标为 min ||X - sum_r lambda_r A_r B_r C_r||，
+    // 固定点处 ||A_sol/lambda|| -> 1，λ 保持稳定。
     auto update_mode =
         [&](int mode, double* d_F, size_t dim, double* d_G) -> bool
     {
-
+        // SVD 伪逆求解：d_F = pseudoinverse(d_FtF) * d_FtV
         const bool ok =
             solve_als_system_svd(
                 svd_ws,
@@ -454,123 +493,156 @@ void execute_als_decomposition(
 
         if (!ok) return false;
 
+        // 除以 λ（权重吸收进 λ 后，因子应回到单位尺度）
         factor_divide_lambda_kernel<<<
             static_cast<int>((dim * static_cast<size_t>(R) + 255) / 256), 256>>>(
             d_F, static_cast<int>(dim), R, d_lambda_out);
         CHECK_CUDA(cudaGetLastError());
 
+        // 列范数
         column_norms_kernel2<<<R, 256>>>(d_F, static_cast<int>(dim), R, d_work_r);
         CHECK_CUDA(cudaGetLastError());
 
+        // 归一化 + λ 吸收（λ[r] *= ||F[:,r]||，固定点处 ||F|| -> 1）
         normalize_absorb_lambda_kernel<<<
             static_cast<int>((dim * static_cast<size_t>(R) + 255) / 256), 256>>>(
             d_F, static_cast<int>(dim), R, d_work_r, d_lambda_out);
         CHECK_CUDA(cudaGetLastError());
 
+        // 更新该模式的 gram（单位列 -> diag = 1，条件数最佳）
         compute_gram_matrix(handle, d_F, dim, R, d_G);
 
         (void)mode;
         return true;
     };
 
+    // ============================================================
+    // Per-mode MTTKRP launcher.
+    //
+    //   融合路径（ALS_FUSED=1 且 R==32 且有稠密池时）：
+    //     一个 grid 内交错的稠密 WMMA（张量核）块 + 稀疏 FP64
+    //     （CUDA 核）块 -> 真正的并发执行；块比例自动按工作量
+    //     分配，可用 ALS_MERGED_STRIDE 覆盖。
+    //   经典路径：稠密/稀疏两条流（本硬件多波网格会串行化，
+    //     实际等效串行）。
+    // ============================================================
+    const bool fused_capable =
+        g_use_fused && (R == 32) &&
+        (hybrid.num_dense_tiles > 0) &&
+        (!hybrid_dense.mttkrp_ready) &&
+        hybrid.mttkrp_ready;
+
+    auto run_mttkrp_mode =
+        [&](int mode, size_t dim_len) -> void
+    {
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        if (fused_capable)
+        {
+            CHECK_CUDA(cudaStreamWaitEvent(dense_stream, factor_event, 0));
+
+            CHECK_CUDA(cudaMemsetAsync(
+                d_FtV, 0,
+                dim_len * static_cast<size_t>(R) * sizeof(double),
+                dense_stream));
+
+            compute_mttkrp_merged_async(
+                hybrid, mode, d_A, d_B, d_C,
+                d_FtV, d_FtF, R, dense_stream);
+
+            CHECK_CUDA(cudaStreamSynchronize(dense_stream));
+        }
+        else
+        {
+            CHECK_CUDA(cudaStreamWaitEvent(dense_stream, factor_event, 0));
+            CHECK_CUDA(cudaStreamWaitEvent(sparse_stream, factor_event, 0));
+
+            CHECK_CUDA(cudaMemsetAsync(
+                d_FtV, 0,
+                dim_len * static_cast<size_t>(R) * sizeof(double),
+                dense_stream));
+            CHECK_CUDA(cudaEventRecord(zero_event, dense_stream));
+            CHECK_CUDA(cudaStreamWaitEvent(sparse_stream, zero_event, 0));
+
+            if (!g_skip_dense)
+            {
+                // 稠密 tile：张量核心（WMMA TF32）路径
+                compute_dense_mttkrp_async(
+                    hybrid, mode, d_A, d_B, d_C,
+                    d_FtV, d_FtF, R, dense_stream);
+            }
+
+            if (!g_skip_sparse)
+            {
+                // 稀疏残差：FP64 协作合并内核
+                compute_sparse_mttkrp_async(
+                    hybrid, mode, d_A, d_B, d_C,
+                    d_FtV, d_FtF, R, sparse_stream);
+
+                // FP64 稠密视图回退（纯 FP64 路径）
+                if (hybrid_dense.mttkrp_ready)
+                {
+                    compute_sparse_mttkrp_async(
+                        hybrid_dense, mode, d_A, d_B, d_C,
+                        d_FtV, d_FtF, R, sparse_stream);
+                }
+            }
+
+            CHECK_CUDA(cudaStreamSynchronize(dense_stream));
+            CHECK_CUDA(cudaStreamSynchronize(sparse_stream));
+        }
+
+        if (mode == 2 && std::getenv("ALS_DEBUG"))
+        {
+            auto t1 = std::chrono::high_resolution_clock::now();
+            std::cout << "[DBG] modeC mttkrp wall = "
+                      << std::chrono::duration<double, std::milli>(t1 - t0).count()
+                      << " ms"
+                      << (fused_capable ? " (fused)" : " (dual)")
+                      << std::endl;
+        }
+    };
+
+    if (fused_capable)
+    {
+        std::cout << "[ALS] FUSED path active: one load-balanced grid"
+                     " (dense WMMA + sparse FP64, R=32)" << std::endl;
+    }
+
     for (int iter = 0; iter < max_iters; ++iter) {
         CHECK_CUDA(cudaEventRecord(iter_start));
 
+        // ---------- Mode A ----------
         compute_gram_matrix(handle, d_B, J, R, d_GtB);
         compute_gram_matrix(handle, d_C, K, R, d_GtC);
         elementwise_mult_kernel<<<grid_rr, 256>>>(d_GtB, d_GtC, d_FtF, RR);
         CHECK_CUDA(cudaGetLastError());
 
-        CHECK_CUDA(cudaStreamWaitEvent(dense_stream, factor_event, 0));
-        CHECK_CUDA(cudaStreamWaitEvent(sparse_stream, factor_event, 0));
-
-        CHECK_CUDA(cudaMemsetAsync(
-            d_FtV, 0, I * static_cast<size_t>(R) * sizeof(double), dense_stream));
-        CHECK_CUDA(cudaEventRecord(zero_event, dense_stream));
-        CHECK_CUDA(cudaStreamWaitEvent(sparse_stream, zero_event, 0));
-
-        compute_dense_mttkrp_async(hybrid, 0, d_A, d_B, d_C,
-                                   d_FtV, d_FtF, R, dense_stream);
-
-        compute_sparse_mttkrp_async(hybrid, 0, d_A, d_B, d_C,
-                                    d_FtV, d_FtF, R, sparse_stream);
-
-        if (hybrid_dense.mttkrp_ready) {
-            compute_sparse_mttkrp_async(hybrid_dense, 0, d_A, d_B, d_C,
-                                        d_FtV, d_FtF, R, sparse_stream);
-        }
-
-        CHECK_CUDA(cudaStreamSynchronize(dense_stream));
-        CHECK_CUDA(cudaStreamSynchronize(sparse_stream));
+        run_mttkrp_mode(0, I);
 
         if (!update_mode(0, d_A, I, d_GtA)) break;
         CHECK_CUDA(cudaEventRecord(factor_event));
 
+        // ---------- Mode B ----------
         compute_gram_matrix(handle, d_A, I, R, d_GtA);
         compute_gram_matrix(handle, d_C, K, R, d_GtC);
         elementwise_mult_kernel<<<grid_rr, 256>>>(d_GtA, d_GtC, d_FtF, RR);
         CHECK_CUDA(cudaGetLastError());
 
-        CHECK_CUDA(cudaStreamWaitEvent(dense_stream, factor_event, 0));
-        CHECK_CUDA(cudaStreamWaitEvent(sparse_stream, factor_event, 0));
-
-        CHECK_CUDA(cudaMemsetAsync(
-            d_FtV, 0, J * static_cast<size_t>(R) * sizeof(double), dense_stream));
-        CHECK_CUDA(cudaEventRecord(zero_event, dense_stream));
-        CHECK_CUDA(cudaStreamWaitEvent(sparse_stream, zero_event, 0));
-
-        compute_dense_mttkrp_async(hybrid, 1, d_A, d_B, d_C,
-                                   d_FtV, d_FtF, R, dense_stream);
-
-        compute_sparse_mttkrp_async(hybrid, 1, d_A, d_B, d_C,
-                                    d_FtV, d_FtF, R, sparse_stream);
-
-        if (hybrid_dense.mttkrp_ready) {
-            compute_sparse_mttkrp_async(hybrid_dense, 1, d_A, d_B, d_C,
-                                        d_FtV, d_FtF, R, sparse_stream);
-        }
-
-        CHECK_CUDA(cudaStreamSynchronize(dense_stream));
-        CHECK_CUDA(cudaStreamSynchronize(sparse_stream));
+        run_mttkrp_mode(1, J);
 
         if (!update_mode(1, d_B, J, d_GtB)) break;
         CHECK_CUDA(cudaEventRecord(factor_event));
 
+        // ---------- Mode C ----------
         compute_gram_matrix(handle, d_A, I, R, d_GtA);
         compute_gram_matrix(handle, d_B, J, R, d_GtB);
         elementwise_mult_kernel<<<grid_rr, 256>>>(d_GtA, d_GtB, d_FtF, RR);
         CHECK_CUDA(cudaGetLastError());
         CHECK_CUDA(cudaEventRecord(t_gram));
 
-        CHECK_CUDA(cudaStreamWaitEvent(dense_stream, factor_event, 0));
-        CHECK_CUDA(cudaStreamWaitEvent(sparse_stream, factor_event, 0));
+        run_mttkrp_mode(2, K);
 
-        CHECK_CUDA(cudaMemsetAsync(
-            d_FtV, 0, K * static_cast<size_t>(R) * sizeof(double), dense_stream));
-        CHECK_CUDA(cudaEventRecord(zero_event, dense_stream));
-        CHECK_CUDA(cudaStreamWaitEvent(sparse_stream, zero_event, 0));
-
-        auto t0 = std::chrono::high_resolution_clock::now();
-
-        compute_dense_mttkrp_async(hybrid, 2, d_A, d_B, d_C,
-                                   d_FtV, d_FtF, R, dense_stream);
-
-        compute_sparse_mttkrp_async(hybrid, 2, d_A, d_B, d_C,
-                                    d_FtV, d_FtF, R, sparse_stream);
-
-        if (hybrid_dense.mttkrp_ready) {
-            compute_sparse_mttkrp_async(hybrid_dense, 2, d_A, d_B, d_C,
-                                        d_FtV, d_FtF, R, sparse_stream);
-        }
-
-        CHECK_CUDA(cudaStreamSynchronize(dense_stream));
-        CHECK_CUDA(cudaStreamSynchronize(sparse_stream));
-        auto t1 = std::chrono::high_resolution_clock::now();
-        if (std::getenv("ALS_DEBUG")) {
-            std::cout << "[DBG] modeC mttkrp wall = "
-                      << std::chrono::duration<double, std::milli>(t1 - t0).count()
-                      << " ms" << std::endl;
-        }
         CHECK_CUDA(cudaEventRecord(t_mtt));
 
         if (!update_mode(2, d_C, K, d_GtC)) break;
@@ -584,9 +656,19 @@ void execute_als_decomposition(
         check_data_integrity(d_C, K * static_cast<size_t>(R), "Mode C factor", d_nan_flag);
 #endif
 
+        // ====================================================
+        // gram fit（O(R^2)，不扫全量张量）
+        //
+        // 因子均为单位列，λ = 权重：
+        //   iprod   = sum_r lambda[r] * (C[:,r] . MTTKRP_C[:,r])
+        //   model^2 = sum_{r,s} lambda_r lambda_s G_A G_B G_C
+        //   fit = 1 - sqrt(X^2 - 2*iprod + model^2) / X
+        // ====================================================
+
         column_dot_kernel<<<R, 256>>>(d_C, d_FtV, static_cast<int>(K), R, d_work_r);
         CHECK_CUDA(cudaGetLastError());
 
+        // iprod = sum_r lambda[r] * work_r[r]
         elementwise_mult_kernel<<<(R + 255) / 256, 256>>>(
             d_lambda_out, d_work_r, d_work_r, R);
         vecsum_kernel<<<1, 256>>>(d_work_r, R, d_scalar);
@@ -595,8 +677,9 @@ void execute_als_decomposition(
         double h_iprod = 0.0;
         CHECK_CUDA(cudaMemcpy(&h_iprod, d_scalar, sizeof(double), cudaMemcpyDeviceToHost));
 
+        // model^2 = sum_{r,s} lambda_r lambda_s G_A G_B G_C
         {
-
+            // 注意：cublasDger 是累加操作（无 beta），必须先清零 d_model
             fill_value_kernel<<<(RR + 255) / 256, 256>>>(
                 d_model, RR, 0.0);
             CHECK_CUDA(cudaGetLastError());
@@ -633,6 +716,7 @@ void execute_als_decomposition(
 
         CHECK_CUDA(cudaEventRecord(t_fit));
 
+        // 本轮全部更新完成信号：下一轮 mttkrp 必须等待归一化完成
         CHECK_CUDA(cudaEventRecord(factor_event));
 
         CHECK_CUDA(cudaEventRecord(iter_stop));
@@ -675,6 +759,10 @@ void execute_als_decomposition(
                       << " (iter=" << ms << ")" << std::endl;
         }
     }
+
+    // ========================================================
+    // 最终报告：精确 RMSE（观测项）+ fit + lambda
+    // ========================================================
 
     double final_rmse = calculate_rmse(
         hybrid, hybrid_dense, d_A, d_B, d_C, d_lambda_out, R);

@@ -11,8 +11,48 @@
 #define TILE_DIM 16
 #endif
 
+// ============================================================
+// Tile coordinate encoding
+//
+// Global coordinate:
+//
+//     (i, j, k)
+//
+// is represented by:
+//
+//     (block_id, local_id)
+//
+// where:
+//
+//     block_id
+//         identifies the TILE_DIM^3 block
+//
+//     local_id
+//         identifies the position inside the block
+//
+// For TILE_DIM = 16:
+//
+//     local_id = (local_i * 16 + local_j) * 16 + local_k
+//
+// Therefore:
+//
+//     0 <= local_id < 16^3 = 4096
+//
+// local_id can theoretically be stored in uint16_t.
+// ============================================================
+
 using BlockId  = std::uint64_t;
 using LocalId  = std::uint16_t;
+
+// ============================================================
+// Block grid
+//
+// Number of blocks along each tensor dimension:
+//
+//     num_blocks_i = ceil(dim_i / TILE_DIM)
+//     num_blocks_j = ceil(dim_j / TILE_DIM)
+//     num_blocks_k = ceil(dim_k / TILE_DIM)
+// ============================================================
 
 inline std::size_t num_blocks_for_dim(
     int dim)
@@ -23,6 +63,21 @@ inline std::size_t num_blocks_for_dim(
         1
     ) / TILE_DIM;
 }
+
+// ============================================================
+// Encode block coordinates
+//
+//     (block_i, block_j, block_k)
+//             ↓
+//          block_id
+//
+// block_id is laid out in row-major order:
+//
+//     block_id =
+//         (block_i * num_blocks_j + block_j)
+//         * num_blocks_k
+//         + block_k
+// ============================================================
 
 inline BlockId encode_block_id(
     std::size_t block_i,
@@ -40,6 +95,15 @@ inline BlockId encode_block_id(
         static_cast<BlockId>(num_blocks_k) +
         static_cast<BlockId>(block_k);
 }
+
+// ============================================================
+// Decode block_id
+//
+//     block_id
+//         ↓
+//     (block_i, block_j, block_k)
+//
+// ============================================================
 
 inline void decode_block_id(
     BlockId block_id,
@@ -72,6 +136,26 @@ inline void decode_block_id(
         );
 }
 
+// ============================================================
+// Encode local coordinate
+//
+//     (local_i, local_j, local_k)
+//              ↓
+//           local_id
+//
+// For TILE_DIM = 16:
+//
+//     local_id =
+//         local_i * 256
+//       + local_j * 16
+//       + local_k
+//
+// Range:
+//
+//     0 <= local_id < 4096
+//
+// ============================================================
+
 constexpr LocalId encode_local_id(
     int local_i,
     int local_j,
@@ -85,6 +169,14 @@ constexpr LocalId encode_local_id(
         local_k
     );
 }
+
+// ============================================================
+// Decode local_id
+//
+//     local_id
+//         ↓
+//     (local_i, local_j, local_k)
+// ============================================================
 
 constexpr void decode_local_id(
     LocalId local_id,
@@ -104,6 +196,16 @@ constexpr void decode_local_id(
     local_i =
         id / (TILE_DIM * TILE_DIM);
 }
+
+// ============================================================
+// Encode global coordinate
+//
+//     (i, j, k)
+//        ↓
+//     block_id
+//     local_id
+//
+// ============================================================
 
 inline void encode_coordinate(
     int i,
@@ -151,6 +253,14 @@ inline void encode_coordinate(
             local_k
         );
 }
+
+// ============================================================
+// Decode global coordinate
+//
+//     block_id + local_id
+//              ↓
+//            (i,j,k)
+// ============================================================
 
 inline void decode_coordinate(
     BlockId block_id,
@@ -204,11 +314,33 @@ inline void decode_coordinate(
         );
 }
 
+// ============================================================
+// GPU Hybrid Partition
+//
+// Partition strategy:
+//
+//     COO (i,j,k,value)
+//
+//         ↓
+//
+//     (block_id, local_id, value)
+//
+//         ↓ sort by block_id
+//
+//     Dense blocks
+//     Sparse blocks
+//
+// ============================================================
+
 void partition_tensor_hybrid(
     const COOTensor& tensor,
     HybridCOOTensor& hybrid,
     double dense_threshold = 0.03
 );
+
+// ============================================================
+// CUDA Stream version
+// ============================================================
 
 void partition_tensor_hybrid_gpu(
     const COOTensor& tensor,
@@ -217,20 +349,38 @@ void partition_tensor_hybrid_gpu(
     cudaStream_t stream
 );
 
+// ============================================================
+// Free
+// ============================================================
+
 void free_hybrid_tensor(
     HybridCOOTensor& hybrid
 );
+
+// ============================================================
+// Build MTTKRP row-sorted views
+//
+// 在 partition_tensor_hybrid_gpu 之后调用一次。
+//
+// 为每个 mode 建立按目标行排序的稀疏视图，
+// 并释放 partition 阶段的临时稀疏坐标数组。
+// ============================================================
 
 void build_mttkrp_views(
     HybridCOOTensor& hybrid,
     cudaStream_t stream
 );
 
+// 构建稠密 tile 部分的 MTTKRP 视图（解码稠密池并复用同一流水线）
 void build_dense_mttkrp_views(
     HybridCOOTensor& hybrid,
     HybridCOOTensor& dense_out,
     cudaStream_t stream
 );
+
+// ============================================================
+// Compatibility with old code
+// ============================================================
 
 inline void create_hybrid_format(
     const COOTensor& coo,
@@ -252,4 +402,4 @@ inline void free_hybrid_format(
     free_hybrid_tensor(hybrid);
 }
 
-#endif
+#endif // PARTITION_HPP

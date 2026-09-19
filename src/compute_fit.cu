@@ -5,6 +5,18 @@
 #include <cmath>
 #include <iostream>
 
+// ============================================================
+// Compute fit
+//
+// fit = 1 - ||X - X_hat||_F / ||X||_F
+//
+// 基于 HybridCOOTensor 的 MTTKRP 视图：
+//
+//     ||X - Xhat||_F^2  由 compute_residual_and_norm_sq() 计算
+//     ||X||_F^2         同上（sumsq 部分）
+//
+// ============================================================
+
 double compute_fit(
     const HybridCOOTensor& h1,
     const HybridCOOTensor& h2,
@@ -40,6 +52,10 @@ double compute_fit(
 
         return -1.0;
     }
+
+    // ========================================================
+    // GPU residual + X norm
+    // ========================================================
 
     double h_res_norm_sq = 0.0;
     double h_X_norm_sq = 0.0;
@@ -87,6 +103,10 @@ double compute_fit(
     double fit =
         1.0 - res_norm / X_norm;
 
+    // ========================================================
+    // Numerical protection
+    // ========================================================
+
     if (fit < 0.0 && fit > -1e-10)
         fit = 0.0;
 
@@ -112,6 +132,9 @@ double compute_fit(
     return fit;
 }
 
+// ============================================================
+// Print fit report
+// ============================================================
 void print_fit_report(
     const HybridCOOTensor& h1,
     const HybridCOOTensor& h2,

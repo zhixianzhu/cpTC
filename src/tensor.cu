@@ -7,6 +7,20 @@
 #include <iostream>
 #include <cmath>
 
+// ============================================================
+// 快速 .tns 加载器
+//
+// 原实现使用 std::ifstream + std::stringstream 逐行解析，
+// 77M 行 / 1.5GB 需要约 20 秒。
+//
+// 新实现：
+//
+//   1. 第一遍只统计行数（用于 reserve，避免 realloc）
+//   2. 第二遍用大缓冲区 + 手写整数解析 + strtod 解析值
+//
+// 大约 1 ~ 3 秒。
+// ============================================================
+
 static inline int fast_parse_int(const char* s, const char** end)
 {
     int v = 0;
@@ -43,7 +57,11 @@ void load_tns_file(
     tensor.h_m2.clear();
     tensor.h_val.clear();
 
-    constexpr size_t BUF_SIZE = 1u << 22;
+    // ========================================================
+    // Pass 1: 统计行数
+    // ========================================================
+
+    constexpr size_t BUF_SIZE = 1u << 22;   // 4 MB
 
     std::vector<char> buf(BUF_SIZE);
 
@@ -67,6 +85,10 @@ void load_tns_file(
     tensor.h_m2.reserve(est_lines);
     tensor.h_val.reserve(est_lines);
 
+    // ========================================================
+    // Pass 2: 解析
+    // ========================================================
+
     size_t max_m0 = 0, max_m1 = 0, max_m2 = 0;
 
     char* const b = buf.data();
@@ -87,6 +109,7 @@ void load_tns_file(
 
         const char* p = s;
 
+        // skip whitespace
         while (p < line_end &&
                (*p == ' ' || *p == '\t'))
             ++p;
@@ -132,14 +155,16 @@ void load_tns_file(
         if (p >= line_end)
             return;
 
+        // 值：strtod 可以处理整数、小数和科学计数法
         char* endc = nullptr;
 
         const double val =
             std::strtod(p, &endc);
 
         if (endc == p)
-            return;
+            return;   // 没有合法数值，跳过该行
 
+        // FROSTT 数据集通常为 1-based 索引，转换为 0-based
         const int m0z = m0 > 0 ? m0 - 1 : 0;
         const int m1z = m1 > 0 ? m1 - 1 : 0;
         const int m2z = m2 > 0 ? m2 - 1 : 0;
@@ -188,10 +213,10 @@ void load_tns_file(
 
         if (line_start < avail)
         {
-
+            // 缓冲区内有未结束的残行
             if (got < BUF_SIZE - carry)
             {
-
+                // EOF：最后一行没有换行符
                 process_line(
                     b + line_start,
                     avail - line_start);
@@ -233,6 +258,7 @@ void load_tns_file(
         << " non-zero elements."
         << std::endl;
 
+    // 分配 GPU 显存用于 RMSE 计算
     CHECK_CUDA(cudaMalloc(&tensor.d_m0, tensor.nnz * sizeof(int)));
     CHECK_CUDA(cudaMalloc(&tensor.d_m1, tensor.nnz * sizeof(int)));
     CHECK_CUDA(cudaMalloc(&tensor.d_m2, tensor.nnz * sizeof(int)));

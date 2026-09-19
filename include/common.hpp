@@ -35,4 +35,4 @@ void compute_residual_and_norm_sq(
     double& h_res_sq,
     double& h_x_sq);
 
-#endif
+#endif // COMMON_HPP

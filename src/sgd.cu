@@ -8,6 +8,31 @@
 #include <algorithm>
 #include <chrono>
 
+// ============================================================
+// CP-SGD（保持 CP 分解 + 随机梯度下降）
+//
+// 参照论文 cuFastTuckerPlusTC 的小批量 warp 采样路线，
+// 但保持 CP 结构（无 core 矩阵）：
+//
+//   x̂(i,j,k) = Σ_r λ_r · A[i,r] · B[j,r] · C[k,r]
+//
+// 每 warp 处理一个采样元素 (i,j,k,v)：
+//   32 线程 = 32 rank，线程 r 持有 A[i,r], B[j,r], C[k,r]
+//   x̂ = Σ_r λ_r·A·B·C（warp 内归约）
+//   e = v - x̂
+//   梯度更新（原子，因为同一行可被多 warp 命中）：
+//     A[i,r] += γ·e·λ_r·B[j,r]·C[k,r]
+//     B[j,r] += γ·e·λ_r·A[i,r]·C[k,r]
+//     C[k,r] += γ·e·λ_r·A[i,r]·B[j,r]
+//     λ_r    += γ·e·A[i,r]·B[j,r]·C[k,r]
+//
+// 数据源：hybrid.d_sp2_coords[mode]（打包 64 位坐标，稀疏残差
+// 65.4M）+ hybrid.d_sp2_val。稠密 tile 由现有 WMMA 路径单独贡献。
+//
+// 注意：SGD 更新需要"当前"因子，跨 warp 原子写保证收敛性
+// （异步 SGD，论文同款）。
+// ============================================================
+
 __device__ __forceinline__
 void decode_packed_sgd(
     uint64_t pc,
@@ -20,15 +45,18 @@ void decode_packed_sgd(
     k = static_cast<uint32_t>(pc & 0x7FFFu);
 }
 
+
+// 每 warp 处理一个采样元素，更新 A/B/C/λ
+// 输入：d_sample_idx 是采样的稀疏残差元素索引（0..sparse_nnz-1）
 __global__ void cpsgd_update_kernel(
-    const uint64_t* __restrict__ d_coords,
-    const double* __restrict__ d_vals,
-    const int* __restrict__ d_sample_idx,
+    const uint64_t* __restrict__ d_coords,   // 打包坐标（稀疏残差）
+    const double* __restrict__ d_vals,       // 稀疏残差值
+    const int* __restrict__ d_sample_idx,    // 本批采样索引
     int batch_size,
 
-    double* __restrict__ d_A,
-    double* __restrict__ d_B,
-    double* __restrict__ d_C,
+    double* __restrict__ d_A,   // dims[0] × R
+    double* __restrict__ d_B,   // dims[1] × R
+    double* __restrict__ d_C,   // dims[2] × R
     double* __restrict__ d_lambda,
 
     int R,
@@ -64,11 +92,13 @@ __global__ void cpsgd_update_kernel(
 
     const int r = lane;
 
+    // 读当前因子（线程 r 持有 rank r 的 3 个值 + λ）
     const double a = __ldg(&d_A[static_cast<size_t>(gi) * R + r]);
     const double b = __ldg(&d_B[static_cast<size_t>(gj) * R + r]);
     const double c = __ldg(&d_C[static_cast<size_t>(gk) * R + r]);
     const double lam = __ldg(&d_lambda[r]);
 
+    // x̂ = Σ_r λ·a·b·c（warp 内全归约）
     double xhat = lam * a * b * c;
 
     #pragma unroll
@@ -77,6 +107,7 @@ __global__ void cpsgd_update_kernel(
         xhat += __shfl_down_sync(0xffffffffu, xhat, off);
     }
 
+    // 广播 x̂ 到所有线程
     xhat = __shfl_sync(0xffffffffu, xhat, 0);
 
     const double e = v - xhat;
@@ -88,6 +119,8 @@ __global__ void cpsgd_update_kernel(
     }
 #endif
 
+    // 梯度更新（原子）。因子梯度不含 λ（λ 每轮由归一化重算，
+    // 不参与 SGD 更新，避免 λ 累积放大导致爆炸）。
     const double g_a   = gamma * e * b * c;
     const double g_b   = gamma * e * a * c;
     const double g_c   = gamma * e * a * b;
@@ -97,6 +130,8 @@ __global__ void cpsgd_update_kernel(
     atomicAdd(&d_C[static_cast<size_t>(gk) * R + r], g_c);
 }
 
+
+// 每 warp 处理一个采样元素：只计算本批的平方误差（用于 fit/监控）
 __global__ void cpsgd_loss_kernel(
     const uint64_t* __restrict__ d_coords,
     const double* __restrict__ d_vals,
@@ -157,6 +192,8 @@ __global__ void cpsgd_loss_kernel(
     }
 }
 
+
+// 均匀采样：生成 [0, nnz) 的随机索引
 __global__ void cpsgd_sample_kernel(
     int* __restrict__ d_sample_idx,
     int batch_size,
@@ -168,6 +205,7 @@ __global__ void cpsgd_sample_kernel(
     if (i >= batch_size)
         return;
 
+    // 简单 hash 随机数（每轮不同 seed）
     unsigned long long x = seed + static_cast<unsigned long long>(i) * 0x9E3779B97F4A7C15ULL;
     x ^= x >> 30;
     x *= 0xBF58476D1CE4E5B9ULL;
@@ -178,6 +216,8 @@ __global__ void cpsgd_sample_kernel(
     d_sample_idx[i] = static_cast<int>(x % static_cast<unsigned long long>(nnz));
 }
 
+
+// 列范数（每 rank 一个 block）
 __global__ void sgd_column_norms_kernel(
     const double* __restrict__ factor,
     int rows,
@@ -214,6 +254,7 @@ __global__ void sgd_column_norms_kernel(
     }
 }
 
+// 因子列归一化 + λ 吸收（与 ALS 同款：λ 承载尺度，因子保持单位列）
 __global__ void sgd_normalize_absorb_kernel(
     double* __restrict__ factor,
     int rows,
@@ -240,10 +281,23 @@ __global__ void sgd_normalize_absorb_kernel(
     {
         const int r = threadIdx.x;
         const double n = d_norms[r];
-
+        // λ 重设为列范数（不累积）：因子缩放到单位列后，
+        // 尺度全部由 λ 承载，λ 每轮重新计算保证量级稳定。
         lambda[r] = (n < 1e-14) ? 0.0 : n;
     }
 }
+
+
+// ============================================================
+// CP-SGD 主循环
+//
+// 每轮：
+//   1. 随机采样 batch_size 个稀疏残差元素
+//   2. 对每元素做 SGD 更新（warp 并行）
+//   3. 定期在验证批上算 loss（监控收敛）
+//
+// 稠密 tile 由调用方用现有 WMMA 路径贡献（本函数只更新稀疏残差）。
+// ============================================================
 
 void execute_sgd_decomposition(
     const HybridCOOTensor& hybrid,
@@ -268,12 +322,14 @@ void execute_sgd_decomposition(
     const uint64_t* d_coords = hybrid.d_sp2_coords[0];
     const double* d_vals = hybrid.d_sp2_val[0];
 
+    // 采样索引缓冲
     int* d_sample_idx = nullptr;
 
     CHECK_CUDA(cudaMalloc(
         &d_sample_idx,
         static_cast<size_t>(batch_size) * sizeof(int)));
 
+    // loss 累加缓冲
     double* d_loss = nullptr;
 
     CHECK_CUDA(cudaMalloc(&d_loss, sizeof(double)));
@@ -296,7 +352,7 @@ void execute_sgd_decomposition(
 
     for (int it = 0; it < max_iters; ++it)
     {
-
+        // 1. 采样
         cpsgd_sample_kernel<<<(batch_size + 255) / 256, 256, 0, stream>>>(
             d_sample_idx,
             batch_size,
@@ -317,6 +373,7 @@ void execute_sgd_decomposition(
                    hA[0],hA[1],hA[2],hA[3], hL[0],hL[1],hL[2],hL[3]);
         }
 
+        // 2. 更新
         cpsgd_update_kernel<<<blocks, threads, 0, stream>>>(
             d_coords,
             d_vals,
@@ -336,6 +393,7 @@ void execute_sgd_decomposition(
                    hL[0],hL[1],hL[2],hL[3],hL[4],hL[5],hL[6],hL[7]);
         }
 
+        // 2.5 每 5 轮归一化因子 + λ 重设（λ 承载尺度，稳定量级）
         if ((it % 5) == 0)
         {
             const int dims[3] = {
@@ -359,6 +417,7 @@ void execute_sgd_decomposition(
             }
         }
 
+        // 3. 每 10 轮算一次训练批 loss（监控，不参与更新）
         if ((it % 10) == 0 || it == max_iters - 1)
         {
             if (std::getenv("ALS_SGD_DBG") && it == 0) {

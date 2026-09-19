@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <iostream>
 
+// CUDA Kernel: GPU 并行执行因子矩阵逆映射还原
 __global__ void unpermute_factor_kernel(const double* __restrict__ d_Factor_perm,
                                         double* __restrict__ d_Factor_orig,
                                         const int* __restrict__ d_perm,
@@ -18,6 +19,7 @@ __global__ void unpermute_factor_kernel(const double* __restrict__ d_Factor_perm
     }
 }
 
+// 1. 实现 compute_cadr_reordering
 TensorPermutation compute_cadr_reordering(const COOTensor& tensor) {
     std::cout << "[CADR] Computing degree-based mode reordering mapping..." << std::endl;
 
@@ -63,6 +65,7 @@ TensorPermutation compute_cadr_reordering(const COOTensor& tensor) {
     return perm;
 }
 
+// 2. 实现 apply_cadr_reordering
 void apply_cadr_reordering(COOTensor& tensor, const TensorPermutation& perm) {
     std::cout << "[CADR] Applying mode permutation to COO tensor coordinates..." << std::endl;
 
@@ -77,6 +80,7 @@ void apply_cadr_reordering(COOTensor& tensor, const TensorPermutation& perm) {
     CHECK_CUDA(cudaMemcpy(tensor.d_m2, tensor.h_m2.data(), tensor.nnz * sizeof(int), cudaMemcpyHostToDevice));
 }
 
+// 3. 实现 unpermute_factor_matrices
 void unpermute_factor_matrices(double* d_A_perm, double* d_B_perm, double* d_C_perm,
                                double** d_factors_orig,
                                const TensorPermutation& perm,
@@ -98,6 +102,7 @@ void unpermute_factor_matrices(double* d_A_perm, double* d_B_perm, double* d_C_p
     CHECK_CUDA(cudaDeviceSynchronize());
 }
 
+// 4. 实现 free_cadr_permutation
 void free_cadr_permutation(TensorPermutation& perm) {
     if (perm.d_perm0) cudaFree(perm.d_perm0);
     if (perm.d_perm1) cudaFree(perm.d_perm1);

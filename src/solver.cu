@@ -774,6 +774,31 @@ __global__ void reciprocal_with_tol_kernel(
     }
 }
 
+// Device-side truncation variant: the tolerance is derived from s_max
+// inside the kernel (gesvdj returns singular values in descending
+// order), removing the per-solve device->host copy and its implicit
+// synchronization.  tol = R * ulp(s_max), same formula as the host path.
+__global__ void reciprocal_with_reltol_kernel(
+    double* __restrict__ s,
+    int n,
+    int R)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    const double smax = s[0];
+    const double tol =
+        (smax > 0.0)
+            ? static_cast<double>(R) *
+                  (nextafter(smax, smax + 1.0) - smax)
+            : 0.0;
+
+    if (idx < n)
+    {
+        const double v = s[idx];
+        s[idx] = (fabs(v) > tol) ? 1.0 / v : 0.0;
+    }
+}
+
 __global__ void scale_columns_kernel(
     double* __restrict__ U,
     const double* __restrict__ S,
@@ -930,6 +955,100 @@ bool solve_als_system_svd(
 
     reciprocal_with_tol_kernel<<<(R + 255) / 256, 256>>>(
         ws.d_S, R, tol);
+    CHECK_CUDA(cudaGetLastError());
+
+    scale_columns_kernel<<<(n2 + 255) / 256, 256>>>(
+        ws.d_U, ws.d_S, R);
+    CHECK_CUDA(cudaGetLastError());
+
+    const double alpha = 1.0;
+    const double beta = 0.0;
+
+    cublasStatus_t cst =
+        cublasDgemm(
+            cublas,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            R, R, R,
+            &alpha,
+            ws.d_V, R,
+            ws.d_U, R,
+            &beta,
+            ws.d_Ainv, R);
+
+    if (cst != CUBLAS_STATUS_SUCCESS)
+    {
+        std::cerr << "[Solver] Ainv gemm failed." << std::endl;
+        return false;
+    }
+
+    cst =
+        cublasDgemm(
+            cublas,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            R, static_cast<int>(dim_len), R,
+            &alpha,
+            ws.d_Ainv, R,
+            d_FtV, R,
+            &beta,
+            d_Factor, R);
+
+    if (cst != CUBLAS_STATUS_SUCCESS)
+    {
+        std::cerr << "[Solver] factor gemm failed." << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+// Same truncated-SVD pseudoinverse solve, but with the truncation
+// tolerance computed on the device: no host round-trip and therefore
+// no per-mode implicit synchronization.  Used by the generic N-order
+// path (N solves per ALS iteration).
+bool solve_als_system_svd_nosync(
+    const SVDWorkspace& ws,
+    cublasHandle_t cublas,
+    double* d_FtF,
+    double* d_FtV,
+    double* d_Factor,
+    size_t dim_len,
+    int R)
+{
+    if (!ws.cusolver || !ws.gesvd_info || R <= 0 || R != ws.R)
+    {
+        std::cerr << "[Solver] SVD workspace not initialized."
+                  << std::endl;
+        return false;
+    }
+
+    const size_t n2 = static_cast<size_t>(R) * R;
+
+    CHECK_CUDA(cudaMemcpy(
+        ws.d_Ainv, d_FtF,
+        n2 * sizeof(double),
+        cudaMemcpyDeviceToDevice));
+
+    cusolverStatus_t st =
+        cusolverDnDgesvdj(
+            ws.cusolver,
+            CUSOLVER_EIG_MODE_VECTOR,
+            0,
+            R, R,
+            ws.d_Ainv, R,
+            ws.d_S,
+            ws.d_U, R,
+            ws.d_V, R,
+            ws.d_work, static_cast<int>(ws.work_len),
+            ws.d_info,
+            ws.gesvd_info);
+
+    if (st != CUSOLVER_STATUS_SUCCESS)
+    {
+        std::cerr << "[Solver] gesvdj failed: " << st << std::endl;
+        return false;
+    }
+
+    reciprocal_with_reltol_kernel<<<(R + 255) / 256, 256>>>(ws.d_S, R, R);
     CHECK_CUDA(cudaGetLastError());
 
     scale_columns_kernel<<<(n2 + 255) / 256, 256>>>(

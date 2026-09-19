@@ -16,4 +16,4 @@ void execute_als_decomposition(
     int max_iters,
     double lambda_reg);
 
-#endif
+#endif // ALS_HPP

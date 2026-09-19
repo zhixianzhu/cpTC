@@ -37,6 +37,18 @@ bool solve_als_system_svd(
     size_t dim_len,
     int R);
 
+// Same truncated-SVD pseudoinverse solve with the truncation
+// tolerance computed on the device (no host s_max readback and
+// therefore no per-solve device synchronization).
+bool solve_als_system_svd_nosync(
+    const SVDWorkspace& ws,
+    cublasHandle_t cublas,
+    double* d_FtF,
+    double* d_FtV,
+    double* d_Factor,
+    size_t dim_len,
+    int R);
+
 void solve_als_system_magma(
     double* d_FtF,
     double* d_FtV,

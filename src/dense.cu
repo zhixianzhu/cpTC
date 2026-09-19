@@ -2,16 +2,55 @@
 #include "common.hpp"
 
 #include <iostream>
+#include <algorithm>
+#include <cmath>
 #include <mma.h>
 #include <cfloat>
 
 using namespace nvcuda;
 
+// ============================================================
+// Tile configuration
+// ============================================================
+
 #define TILE_DIM 16
+
+// CUDA WMMA TF32
+// M = 16
+// N = 16
+// K = 8
 
 #define WMMA_M 16
 #define WMMA_N 16
 #define WMMA_K 8
+
+
+// ============================================================
+// Device helper
+//
+// 新数据格式：
+//
+// DenseTile16
+//
+//     block_idx[0] = block_i
+//     block_idx[1] = block_j
+//     block_idx[2] = block_k
+//
+//     d_coords[i] = local_id
+//
+// local_id:
+//
+//     local_id =
+//         (local_i * 16 + local_j) * 16
+//         + local_k
+//
+// 因此：
+//
+//     local_i = local_id / 256
+//     local_j = (local_id / 16) % 16
+//     local_k = local_id % 16
+//
+// ============================================================
 
 __device__ __forceinline__
 void decode_dense_local_id(
@@ -29,6 +68,23 @@ void decode_dense_local_id(
     local_i =
         local_id / (TILE_DIM * TILE_DIM);
 }
+
+
+// ============================================================
+// Dense Tile MTTKRP Kernel
+//
+// Tensor Core / WMMA / TF32
+//
+// 每个 warp 处理一个 Dense Tile。
+//
+// ============================================================
+
+// ============================================================
+// Dense Tile MTTKRP - single warp implementation
+//
+// 可由独立内核（1 warp/block）或合并内核（稠密+稀疏单网格）
+// 调用。s_mem 指向本 warp 的共享内存区域（19KB 完整 tile）。
+// ============================================================
 
 __device__ __forceinline__
 void dense_tile_mttkrp_wmma(
@@ -53,6 +109,22 @@ void dense_tile_mttkrp_wmma(
     int dimK)
 {
 
+    // ========================================================
+    // Tile global origin
+    //
+    // block_idx 保存的是块号，不是全局坐标。
+    //
+    // 例如：
+    //
+    // block_idx = (2,1,3)
+    //
+    // TILE_DIM = 16
+    //
+    // tile origin =
+    //
+    //     (32,16,48)
+    // ========================================================
+
     int b0 =
         tile.block_idx[0] *
         TILE_DIM;
@@ -64,6 +136,10 @@ void dense_tile_mttkrp_wmma(
     int b2 =
         tile.block_idx[2] *
         TILE_DIM;
+
+    // ========================================================
+    // Shared memory layout (19KB per warp, full tile)
+    // ========================================================
 
     const int SHARED_PER_WARP =
         4096 +
@@ -88,6 +164,11 @@ void dense_tile_mttkrp_wmma(
         s_factor +
         256;
 
+
+    // ========================================================
+    // Clear dense tile
+    // ========================================================
+
     for (int i = lane_id;
          i < 4096;
          i += 32)
@@ -97,13 +178,35 @@ void dense_tile_mttkrp_wmma(
 
     __syncwarp();
 
+
+    // ========================================================
+    // Load sparse entries into dense tile
+    //
+    // 新格式：
+    //
+    //     d_coords[i] = local_id
+    //
+    // 不再使用：
+    //
+    //     packed_coord >> 8
+    //     packed_coord >> 4
+    //
+    // ========================================================
+
     for (int i = lane_id;
          i < tile.nnz;
          i += 32)
     {
+        // ----------------------------------------------------
+        // local_id
+        // ----------------------------------------------------
 
         int local_id =
             tile.d_coords[i];
+
+        // ----------------------------------------------------
+        // Decode local coordinate
+        // ----------------------------------------------------
 
         int local_i;
         int local_j;
@@ -115,6 +218,10 @@ void dense_tile_mttkrp_wmma(
             local_j,
             local_k);
 
+        // ----------------------------------------------------
+        // Defensive protection
+        // ----------------------------------------------------
+
         if (local_i < 0 ||
             local_i >= TILE_DIM ||
             local_j < 0 ||
@@ -125,14 +232,36 @@ void dense_tile_mttkrp_wmma(
             continue;
         }
 
+        // ----------------------------------------------------
+        // Value
+        // ----------------------------------------------------
+
         double raw_val =
             tile.d_values[i];
+
+        // ----------------------------------------------------
+        // TF32 path uses float.
+        //
+        // Protect conversion from extreme double values.
+        // ----------------------------------------------------
 
         if (raw_val > FLT_MAX)
             raw_val = FLT_MAX;
 
         if (raw_val < -FLT_MAX)
             raw_val = -FLT_MAX;
+
+        // ----------------------------------------------------
+        // Dense tile layout:
+        //
+        //     [i][j][k]
+        //
+        // linear:
+        //
+        //     i * 256
+        //   + j * 16
+        //   + k
+        // ----------------------------------------------------
 
         s_tile_dense[
             local_i * 256 +
@@ -143,6 +272,14 @@ void dense_tile_mttkrp_wmma(
     }
 
     __syncwarp();
+
+
+    // ========================================================
+    // WMMA fragments
+    //
+    // TF32 input
+    // FP32 accumulator
+    // ========================================================
 
     wmma::fragment<
         wmma::matrix_a,
@@ -172,10 +309,32 @@ void dense_tile_mttkrp_wmma(
         float>
         c_frag;
 
+
+    // ========================================================
+    // Rank blocking
+    //
+    // 每次处理 16 个 rank。
+    // ========================================================
+
     for (int r_base = 0;
          r_base < R;
          r_base += 16)
     {
+
+        // ====================================================
+        // Mode 0
+        //
+        // 更新 A
+        //
+        // A(i,r) =
+        //
+        //     sum_jk
+        //
+        //         X(i,j,k)
+        //         * B(j,r)
+        //         * C(k,r)
+        //
+        // ====================================================
 
         if (mode == 0)
         {
@@ -188,6 +347,11 @@ void dense_tile_mttkrp_wmma(
             {
                 total_accum[iter] = 0.0;
             }
+
+
+            // ------------------------------------------------
+            // B tile 一次性载入共享内存（k 不变，避免 16 次重载）
+            // ------------------------------------------------
 
             for (int i = lane_id;
                  i < 256;
@@ -235,12 +399,27 @@ void dense_tile_mttkrp_wmma(
                 s_factor + 128,
                 16);
 
+            // ------------------------------------------------
+            // Iterate k inside tile
+            // ------------------------------------------------
+
             for (int k = 0;
                  k < 16;
                  ++k)
             {
                 if ((b2 + k) >= dimK)
                     continue;
+
+
+                // ============================================
+                // Construct X(:,:,k)
+                //
+                // s_slice_k:
+                //
+                //     rows = i
+                //     cols = j
+                //
+                // ============================================
 
                 for (int i = lane_id;
                      i < 256;
@@ -261,9 +440,28 @@ void dense_tile_mttkrp_wmma(
 
                 __syncwarp();
 
+
+                // ============================================
+                // Tensor Core GEMM
+                //
+                // 16x16x16
+                //
+                // WMMA K = 8
+                //
+                // split:
+                //
+                //     K = 0..7
+                //     K = 8..15
+                // ============================================
+
                 wmma::fill_fragment(
                     c_frag,
                     0.0f);
+
+
+                // ------------------------------------------------
+                // K = 0..7
+                // ------------------------------------------------
 
                 wmma::load_matrix_sync(
                     a_frag_0,
@@ -276,6 +474,11 @@ void dense_tile_mttkrp_wmma(
                     b_frag_0,
                     c_frag);
 
+
+                // ------------------------------------------------
+                // K = 8..15
+                // ------------------------------------------------
+
                 wmma::load_matrix_sync(
                     a_frag_1,
                     s_slice_k + 8,
@@ -287,6 +490,11 @@ void dense_tile_mttkrp_wmma(
                     b_frag_1,
                     c_frag);
 
+
+                // ============================================
+                // Store GEMM output
+                // ============================================
+
                 wmma::store_matrix_sync(
                     s_gemm_out,
                     c_frag,
@@ -294,6 +502,11 @@ void dense_tile_mttkrp_wmma(
                     wmma::mem_row_major);
 
                 __syncwarp();
+
+
+                // ============================================
+                // Multiply C
+                // ============================================
 
                 for (int iter = 0;
                      iter < 8;
@@ -335,6 +548,11 @@ void dense_tile_mttkrp_wmma(
                 __syncwarp();
             }
 
+
+            // ================================================
+            // Atomic update A
+            // ================================================
+
             for (int iter = 0;
                  iter < 8;
                  ++iter)
@@ -370,6 +588,22 @@ void dense_tile_mttkrp_wmma(
             }
         }
 
+
+        // ====================================================
+        // Mode 1
+        //
+        // 更新 B
+        //
+        // B(j,r) =
+        //
+        //     sum_ik
+        //
+        //         X(i,j,k)
+        //         * A(i,r)
+        //         * C(k,r)
+        //
+        // ====================================================
+
         else if (mode == 1)
         {
             double total_accum[8];
@@ -382,6 +616,8 @@ void dense_tile_mttkrp_wmma(
                 total_accum[iter] = 0.0;
             }
 
+
+            // A tile 一次性载入共享内存（k 不变）
             for (int i = lane_id;
                  i < 256;
                  i += 32)
@@ -435,6 +671,14 @@ void dense_tile_mttkrp_wmma(
                 if ((b2 + k) >= dimK)
                     continue;
 
+
+                // ============================================
+                // X(:, :, k)
+                //
+                // rows = j
+                // cols = i
+                // ============================================
+
                 for (int i = lane_id;
                      i < 256;
                      i += 32)
@@ -454,9 +698,17 @@ void dense_tile_mttkrp_wmma(
 
                 __syncwarp();
 
+
+                // ============================================
+                // WMMA
+                // ============================================
+
                 wmma::fill_fragment(
                     c_frag,
                     0.0f);
+
+
+                // K = 0..7
 
                 wmma::load_matrix_sync(
                     a_frag_0,
@@ -469,6 +721,9 @@ void dense_tile_mttkrp_wmma(
                     b_frag_0,
                     c_frag);
 
+
+                // K = 8..15
+
                 wmma::load_matrix_sync(
                     a_frag_1,
                     s_slice_k + 8,
@@ -480,6 +735,7 @@ void dense_tile_mttkrp_wmma(
                     b_frag_1,
                     c_frag);
 
+
                 wmma::store_matrix_sync(
                     s_gemm_out,
                     c_frag,
@@ -487,6 +743,11 @@ void dense_tile_mttkrp_wmma(
                     wmma::mem_row_major);
 
                 __syncwarp();
+
+
+                // ============================================
+                // Multiply C
+                // ============================================
 
                 for (int iter = 0;
                      iter < 8;
@@ -528,6 +789,11 @@ void dense_tile_mttkrp_wmma(
                 __syncwarp();
             }
 
+
+            // ================================================
+            // Atomic update B
+            // ================================================
+
             for (int iter = 0;
                  iter < 8;
                  ++iter)
@@ -563,6 +829,22 @@ void dense_tile_mttkrp_wmma(
             }
         }
 
+
+        // ====================================================
+        // Mode 2
+        //
+        // 更新 C
+        //
+        // C(k,r) =
+        //
+        //     sum_ij
+        //
+        //         X(i,j,k)
+        //         * A(i,r)
+        //         * B(j,r)
+        //
+        // ====================================================
+
         else if (mode == 2)
         {
             double total_accum[8];
@@ -575,6 +857,12 @@ void dense_tile_mttkrp_wmma(
                 total_accum[iter] = 0.0;
             }
 
+
+            // ------------------------------------------------
+            // Iterate j inside tile
+            // ------------------------------------------------
+
+            // A tile 一次性载入共享内存（j 不变）
             for (int i = lane_id;
                  i < 256;
                  i += 32)
@@ -628,6 +916,14 @@ void dense_tile_mttkrp_wmma(
                 if ((b1 + j) >= dimJ)
                     continue;
 
+
+                // ============================================
+                // X(:,j,:)
+                //
+                // rows = k
+                // cols = i
+                // ============================================
+
                 for (int i = lane_id;
                      i < 256;
                      i += 32)
@@ -647,9 +943,17 @@ void dense_tile_mttkrp_wmma(
 
                 __syncwarp();
 
+
+                // ============================================
+                // WMMA
+                // ============================================
+
                 wmma::fill_fragment(
                     c_frag,
                     0.0f);
+
+
+                // K = 0..7
 
                 wmma::load_matrix_sync(
                     a_frag_0,
@@ -662,6 +966,9 @@ void dense_tile_mttkrp_wmma(
                     b_frag_0,
                     c_frag);
 
+
+                // K = 8..15
+
                 wmma::load_matrix_sync(
                     a_frag_1,
                     s_slice_k + 8,
@@ -673,6 +980,7 @@ void dense_tile_mttkrp_wmma(
                     b_frag_1,
                     c_frag);
 
+
                 wmma::store_matrix_sync(
                     s_gemm_out,
                     c_frag,
@@ -680,6 +988,11 @@ void dense_tile_mttkrp_wmma(
                     wmma::mem_row_major);
 
                 __syncwarp();
+
+
+                // ============================================
+                // Multiply B
+                // ============================================
 
                 for (int iter = 0;
                      iter < 8;
@@ -721,6 +1034,11 @@ void dense_tile_mttkrp_wmma(
                 __syncwarp();
             }
 
+
+            // ================================================
+            // Atomic update C
+            // ================================================
+
             for (int iter = 0;
                  iter < 8;
                  ++iter)
@@ -757,6 +1075,18 @@ void dense_tile_mttkrp_wmma(
         }
     }
 }
+
+
+// ============================================================
+// Dense Tile MTTKRP - COMPACT shared-memory variant
+//
+// 不物化完整 16^3 tile：每个 k 切片通过扫描 tile 条目
+// （全局池）构建。共享内存仅 3KB/block，使合并内核中
+// 稠密/稀疏 block 能共驻 SM（17 blocks/SM）。
+//
+// 注意：本变体比完整 tile 变体慢（逐 k 扫描全局池），
+// 仅用于合并内核 —— 其耗时藏在稀疏 44ms 之下。
+// ============================================================
 
 __device__ __forceinline__
 void dense_tile_mttkrp_wmma_compact(
@@ -809,11 +1139,13 @@ void dense_tile_mttkrp_wmma_compact(
     const int b2 =
         tile.block_idx[2] * TILE_DIM;
 
+    // k 分组偏移（相对 tile 池段起点）
     const int* k_off =
         d_k_offsets
             ? d_k_offsets + tile_index * 16
             : nullptr;
 
+    // WMMA fragments (TF32 input, FP32 accumulator)
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K,
                    wmma::precision::tf32, wmma::row_major> a_frag_0;
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K,
@@ -824,11 +1156,15 @@ void dense_tile_mttkrp_wmma_compact(
                    wmma::precision::tf32, wmma::row_major> b_frag_1;
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
 
+    // rank 分块：一次处理 16 个 rank
     for (int r_base = 0;
          r_base < R;
          r_base += WMMA_N)
     {
-
+        // Stage factor rows into smem (B for mode 0, A for modes 1/2)
+        //
+        // 注意：因子行索引 = tile 块原点 + 块内局部索引
+        // （mode 0: B 的 j 行 -> b1；mode 1/2: A 的 i 行 -> b0）
         const double* factor_mat =
             (mode == 0) ? d_B : d_A;
 
@@ -868,14 +1204,26 @@ void dense_tile_mttkrp_wmma_compact(
 
         if (mode == 2)
         {
+            // ==================================================
+            // Mode 2: 更新 C
+            //
+            // C(k,r) = sum_ij X(i,j,k) * A(i,r) * B(j,r)
+            //
+            // k 分组池下改为：
+            //   D(i,r) = sum_j X(i,j,k) * B(j,r)   （同 mode 0 切片）
+            //   C(k,r) += sum_i A(i,r) * D(i,r)
+            //
+            // 只用 k 分组（1x 池扫描），不再按 j 扫描。
+            // ==================================================
 
+            // 先载入 B 因子到 s_factor（mode 2 的 factor 是 B，k 无关）
             {
                 for (int i = lane_id;
                      i < 256;
                      i += 32)
                 {
-                    const int o_row = i / 16;
-                    const int r_col = i % 16;
+                    const int o_row = i / 16;   // j
+                    const int r_col = i % 16;   // rank
 
                     const int gr = r_base + r_col;
 
@@ -914,6 +1262,7 @@ void dense_tile_mttkrp_wmma_compact(
 
                 __syncwarp();
 
+                // slice X(i,j,k)：rows=i, cols=j（同 mode 0）
                 if (k_off != nullptr)
                 {
                     const int k0 = k_off[k];
@@ -962,6 +1311,7 @@ void dense_tile_mttkrp_wmma_compact(
 
                 __syncwarp();
 
+                // WMMA: D(i, r) += X(i,j,k) * B(j, r)
                 wmma::fill_fragment(c_frag, 0.0f);
 
                 wmma::load_matrix_sync(a_frag_0, s_slice_k, 16);
@@ -977,12 +1327,13 @@ void dense_tile_mttkrp_wmma_compact(
 
                 __syncwarp();
 
+                // C(k,r) += sum_i A(i,r) * D(i,r)
                 for (int i = lane_id;
                      i < 256;
                      i += 32)
                 {
-                    const int row = i / 16;
-                    const int col = i % 16;
+                    const int row = i / 16;   // i
+                    const int col = i % 16;   // rank
 
                     const int gr = r_base + col;
 
@@ -1014,7 +1365,7 @@ void dense_tile_mttkrp_wmma_compact(
                 __syncwarp();
             }
 
-            continue;
+            continue;  // 下一 rank 块
         }
 
         for (int k = 0;
@@ -1024,6 +1375,7 @@ void dense_tile_mttkrp_wmma_compact(
             if ((b2 + k) >= dimK)
                 continue;
 
+            // Build X(:,:,k) slice by scanning tile entries
             for (int i = lane_id;
                  i < 256;
                  i += 32)
@@ -1035,7 +1387,8 @@ void dense_tile_mttkrp_wmma_compact(
 
             if (mode == 0)
             {
-
+                // rows = i, cols = j, fix k
+                // k 分组池：只扫描 [k_off[k], k_off[k+1]) 连续区间
                 if (k_off != nullptr)
                 {
                     const int k0 = k_off[k];
@@ -1084,7 +1437,7 @@ void dense_tile_mttkrp_wmma_compact(
             }
             else if (mode == 1)
             {
-
+                // rows = j, cols = i, fix k
                 if (k_off != nullptr)
                 {
                     const int k0 = k_off[k];
@@ -1133,11 +1486,12 @@ void dense_tile_mttkrp_wmma_compact(
             }
             else
             {
-
+                // mode 2 已在独立循环处理，这里不可达
             }
 
             __syncwarp();
 
+            // WMMA: C(i, rank) += X(i,j,k) * F(j, rank)
             wmma::fill_fragment(c_frag, 0.0f);
 
             wmma::load_matrix_sync(a_frag_0, s_slice_k, 16);
@@ -1153,6 +1507,7 @@ void dense_tile_mttkrp_wmma_compact(
 
             __syncwarp();
 
+            // C = sum over k: FtV[row][rank] += C_out * C_factor[k][rank]
             const double* c_mat =
                 (mode == 0) ? d_C :
                 (mode == 1) ? d_C : d_B;
@@ -1206,6 +1561,11 @@ void dense_tile_mttkrp_wmma_compact(
     }
 }
 
+
+// ============================================================
+// Standalone dense MTTKRP kernel (1 warp per block)
+// ============================================================
+
 __global__
 void dense_mttkrp_wmma_kernel(
     const DenseTile16* __restrict__ tiles,
@@ -1237,6 +1597,7 @@ void dense_mttkrp_wmma_kernel(
     DenseTile16 tile =
         tiles[global_warp_id];
 
+    // 完整 tile 方案（实测 13.8ms/模式，双流串行下最优）
     dense_tile_mttkrp_wmma(
         tile,
 
@@ -1258,6 +1619,30 @@ void dense_mttkrp_wmma_kernel(
         dimJ,
         dimK);
 }
+
+
+// ============================================================
+// MERGED MTTKRP kernel (dense tiles + sparse segments in ONE grid)
+//
+// 目标：本驱动（560.35.05）上两条独立流的内核从不并行
+// （work distributor 网格级串行，8 组微基准验证），
+// 唯一能真正并行的是单网格内按 blockIdx 分工：
+//
+//     blockIdx.x % 2 == 0  -> 稠密 tile（张量核心 WMMA）
+//     blockIdx.x % 2 == 1  -> 稀疏段（FP64 CUDA 核）
+//
+// 强制分 SM：通过 block 数量比例控制两路各占多少 SM 槽位。
+// 合并后寄存器取两路最大值（稠密 116），但实测稀疏核在
+// 8 warps/SM 下吞吐不变（带宽受限而非延迟受限），
+// 因此合并不会伤稀疏性能。
+//
+// 本内核只处理 R == 32 的情况（1 warp 恰好覆盖 32 个 rank，
+// 稀疏段无需跨 warp 归约）。R 其它取值走原双流路径。
+// ============================================================
+
+// ============================================================
+// Packed-coordinate decode（与 sparse.cu 同款，合并内核内联使用）
+// ============================================================
 
 __device__ __forceinline__
 void decode_packed_coords_merged(
@@ -1290,6 +1675,14 @@ void decode_packed_coords_merged(
         o1 = j;
     }
 }
+
+
+// ============================================================
+// 1-warp sparse segment（32 线程 = 32 rank，lane 即 rank）
+//
+// 32 线程/block 的合并内核使用：无需跨 warp 归约、无需 s_red，
+// 共享内存占用为 0 —— 这是让合并内核每 SM 驻留 33 个 block 的关键。
+// ============================================================
 
 __device__ __forceinline__
 void sparse_segment_mttkrp_warp(
@@ -1325,6 +1718,7 @@ void sparse_segment_mttkrp_warp(
     const uint32_t end =
         start + cnt;
 
+    // lane 即 rank：每个 lane 只累加自己的 rank
     const int r =
         lane_id;
 
@@ -1372,6 +1766,7 @@ void sparse_segment_mttkrp_warp(
             acc);
     }
 }
+
 
 __device__ __forceinline__
 void sparse_segment_mttkrp_block(
@@ -1456,6 +1851,7 @@ void sparse_segment_mttkrp_block(
                 r];
     }
 
+    // 跨 warp 归约（与 sparse.cu 的 coalesced kernel 相同）
     constexpr int WARPS = THREADS / 32;
 
     __shared__ double s_red[WARPS][R];
@@ -1497,6 +1893,24 @@ void sparse_segment_mttkrp_block(
     }
 }
 
+
+// 合并内核：每个 block 128 线程（4 warps）。
+//
+// blockIdx 偶数 -> 稠密 block：4 个 warp 各处理一个稠密 tile
+//                 （warp w 处理 tiles[4*work_id + w]），
+//                 每 warp 3KB 共享内存（紧凑 tile），共 12KB。
+//
+// blockIdx 奇数 -> 稀疏 block：128 线程协作处理一个稀疏段
+//                 （与 sparse.cu 的 coalesced kernel 同结构，
+//                  跨 warp 用共享内存归约），1KB 共享内存。
+//
+// 共享内存统一分配 12KB（稠密路径的上限）：
+//     100KB / 12KB = 8 blocks/SM；
+//     寄存器取两路最大值 ~116 -> 4 blocks/SM（16 warps/SM）。
+//     稀疏部分约占 8 warps/SM —— 实测稀疏核在该占用率下吞吐不变。
+//
+// 本内核只处理 R == 32。
+
 __global__
 void mttkrp_merged_kernel(
     const DenseTile16* __restrict__ tiles,
@@ -1516,7 +1930,7 @@ void mttkrp_merged_kernel(
 
     int num_sparse_segments,
 
-    int dense_stride,
+    int dense_every,
 
     const double* __restrict__ d_A,
     const double* __restrict__ d_B,
@@ -1533,20 +1947,35 @@ void mttkrp_merged_kernel(
 
     extern __shared__ float s_mem_float[];
 
-    const bool is_dense =
-        (num_dense_tiles > 0) &&
-        ((blockIdx.x % dense_stride) == 0);
+    // -------- role assignment (load-balanced fused grid) --------
+    //  * both sides present: dense blocks occupy every dense_every-th
+    //    position (bi % dense_every == 0), sparse blocks fill the rest;
+    //    host sizes the grid so that ALL dense tiles and ALL sparse
+    //    segments are covered, guards below just idle the few leftovers.
+    //  * one-sided grids (only dense or only sparse) map directly.
+    const int bi = blockIdx.x;
 
-    const int dense_slot =
-        blockIdx.x / dense_stride;
+    bool is_dense = false;
+    int  work_id  = 0;
 
-    const int sparse_slot =
-        blockIdx.x -
-        blockIdx.x / dense_stride -
-        1;
-
-    const int work_id =
-        is_dense ? dense_slot : sparse_slot;
+    if (num_sparse_segments <= 0)
+    {
+        is_dense = true;
+        work_id  = bi;
+    }
+    else if (num_dense_tiles <= 0)
+    {
+        is_dense = false;
+        work_id  = bi;
+    }
+    else
+    {
+        is_dense = ((bi % dense_every) == 0);
+        if (is_dense)
+            work_id = bi / dense_every;
+        else
+            work_id = bi - (bi + dense_every - 1) / dense_every;
+    }
 
     const double* F1 = nullptr;
     const double* F2 = nullptr;
@@ -1569,7 +1998,7 @@ void mttkrp_merged_kernel(
 
     if (is_dense)
     {
-
+        // 稠密 block：1 个 warp 处理 1 个 tile（紧凑 tile，3KB smem）
         if (work_id >= num_dense_tiles)
             return;
 
@@ -1603,7 +2032,7 @@ void mttkrp_merged_kernel(
     }
     else
     {
-
+        // 稀疏 block：1 个 warp 处理 1 个段（lane 即 rank，0 smem）
         if (work_id >= num_sparse_segments)
             return;
 
@@ -1627,6 +2056,18 @@ void mttkrp_merged_kernel(
             lane_id);
     }
 }
+
+
+// ============================================================
+// Async dense MTTKRP launcher
+//
+// Important:
+//
+//     NO cudaDeviceSynchronize()
+//
+// All CUDA operations are submitted to caller-provided stream.
+//
+// ============================================================
 
 void compute_dense_mttkrp_async(
     const HybridCOOTensor& hybrid,
@@ -1655,6 +2096,11 @@ void compute_dense_mttkrp_async(
     if (hybrid.num_dense_tiles == 0)
         return;
 
+
+    // ========================================================
+    // Device tile metadata
+    // ========================================================
+
     DenseTile16* d_tiles =
         nullptr;
 
@@ -1663,11 +2109,33 @@ void compute_dense_mttkrp_async(
             hybrid.num_dense_tiles) *
         sizeof(DenseTile16);
 
+
+    // ========================================================
+    // Stream ordered allocation
+    // ========================================================
+
     CHECK_CUDA(
         cudaMallocAsync(
             &d_tiles,
             tile_bytes,
             stream));
+
+
+    // ========================================================
+    // Copy tile metadata
+    //
+    // 注意：
+    //
+    // DenseTile16 中的 d_coords / d_values
+    // 本身是 GPU pointer。
+    //
+    // 这些 pointer 指向：
+    //
+    //     hybrid.d_dense_coords_pool
+    //     hybrid.d_dense_values_pool
+    //
+    // 因此这里仅复制 metadata。
+    // ========================================================
 
     CHECK_CUDA(
         cudaMemcpyAsync(
@@ -1681,11 +2149,17 @@ void compute_dense_mttkrp_async(
 
             stream));
 
+
+    // ========================================================
+    // Kernel configuration
+    // ========================================================
+
     constexpr int warps_per_block =
         1;
 
     constexpr int threads_per_block =
         warps_per_block * 32;
+
 
     const int blocks =
         (
@@ -1694,6 +2168,11 @@ void compute_dense_mttkrp_async(
             1
         ) /
         warps_per_block;
+
+
+    // ========================================================
+    // Shared memory
+    // ========================================================
 
     const size_t shared_mem_size =
         static_cast<size_t>(
@@ -1708,6 +2187,7 @@ void compute_dense_mttkrp_async(
 
         sizeof(float);
 
+
     CHECK_CUDA(
         cudaFuncSetAttribute(
             dense_mttkrp_wmma_kernel,
@@ -1716,6 +2196,11 @@ void compute_dense_mttkrp_async(
 
             static_cast<int>(
                 shared_mem_size)));
+
+
+    // ========================================================
+    // Launch
+    // ========================================================
 
     dense_mttkrp_wmma_kernel<<<
         blocks,
@@ -1745,14 +2230,30 @@ void compute_dense_mttkrp_async(
             static_cast<int>(
                 hybrid.dims[2]));
 
+
     CHECK_CUDA(
         cudaGetLastError());
+
+
+    // ========================================================
+    // Stream ordered free
+    // ========================================================
 
     CHECK_CUDA(
         cudaFreeAsync(
             d_tiles,
             stream));
 }
+
+
+// ============================================================
+// MERGED MTTKRP launcher
+//
+// 稠密 tile（张量核心）+ 稀疏段（CUDA 核）合并在单网格中，
+// 按 blockIdx 奇偶分工 —— 本驱动唯一能真正并行两路负载的方式。
+//
+// 仅支持 R == 32。其它 R 走原双流路径（调用方保证）。
+// ============================================================
 
 void compute_mttkrp_merged_async(
     const HybridCOOTensor& hybrid,
@@ -1773,9 +2274,11 @@ void compute_mttkrp_merged_async(
     (void)d_FtF;
     (void)R;
 
+    // 实验开关：ALS_MERGED_NO_DENSE=1 时跳过稠密（测稀疏路径本身）
     static const bool no_dense =
         std::getenv("ALS_MERGED_NO_DENSE") != nullptr;
 
+    // ALS_MERGED_NO_SPARSE=1 时跳过稀疏（测稠密路径本身）
     static const bool no_sparse =
         std::getenv("ALS_MERGED_NO_SPARSE") != nullptr;
 
@@ -1784,6 +2287,10 @@ void compute_mttkrp_merged_async(
     {
         return;
     }
+
+    // ========================================================
+    // Device tile metadata (dense tiles only)
+    // ========================================================
 
     DenseTile16* d_tiles =
         nullptr;
@@ -1814,6 +2321,11 @@ void compute_mttkrp_merged_async(
                 stream));
     }
 
+    // ========================================================
+    // Load-balanced grid sizing
+    // ========================================================
+
+    // 稠密 block：每个 1 个 tile（1 warp）
     const int num_dense_blocks =
         no_dense
             ? 0
@@ -1825,35 +2337,79 @@ void compute_mttkrp_merged_async(
             : static_cast<int>(
                 hybrid.mttkrp_blocks[mode]);
 
-    const int max_work =
-        num_dense_blocks > num_sparse_segments
-            ? num_dense_blocks
-            : num_sparse_segments;
+    if (num_dense_blocks == 0 &&
+        num_sparse_segments == 0)
+    {
+        return;
+    }
 
+    // dense_every = k  -> 每 k 个 block 中 1 个是稠密 tile
+    //（其余 k-1 个是稀疏段），实现两类工作在同一 grid 内按
+    // 硬件调度交错（真正的 TC/CUDA-core 并发）。
     static const int stride_override =
         std::getenv("ALS_MERGED_STRIDE")
             ? std::atoi(std::getenv("ALS_MERGED_STRIDE"))
             : 0;
 
-    const int dense_stride =
-        stride_override > 0 ? stride_override :
-        (num_sparse_segments == 0) ? 1 :
-        (num_dense_blocks > 0)
-            ? (num_dense_blocks + num_sparse_segments +
-               num_dense_blocks - 1) / num_dense_blocks
-            : 2;
+    int dense_every = 1;
+    int grid = 0;
 
-    const int grid =
-        (no_dense || no_sparse)
-            ? max_work
-            : (num_dense_blocks * dense_stride > num_sparse_segments
-                ? num_dense_blocks * dense_stride
-                : num_sparse_segments + num_dense_blocks);
+    if (num_sparse_segments <= 0)
+    {
+        grid = num_dense_blocks;              // dense-only grid
+    }
+    else if (num_dense_blocks <= 0)
+    {
+        grid = num_sparse_segments;           // sparse-only grid
+    }
+    else
+    {
+        int k = stride_override;
 
-    if (grid == 0)
+        if (k <= 0)
+        {
+            const double frac_dense =
+                static_cast<double>(num_dense_blocks) /
+                (static_cast<double>(num_dense_blocks) +
+                 static_cast<double>(num_sparse_segments));
+
+            // 稠密块约每 (1/frac_dense) 个槽位出现一次
+            k = std::max(
+                2,
+                static_cast<int>(
+                    std::round(1.0 / frac_dense)));
+        }
+
+        dense_every = k;
+
+        // 总网格 T 必须完整覆盖所有稠密 tile 与所有稀疏段，
+        // 内核守卫只让少量尾部槽位空转。
+        size_t T = std::max(
+            static_cast<size_t>(num_dense_blocks) +
+                static_cast<size_t>(num_sparse_segments),
+            static_cast<size_t>(k) *
+                    (static_cast<size_t>(num_dense_blocks) - 1) +
+                1);
+
+        while (T - (T + static_cast<size_t>(k) - 1) /
+                       static_cast<size_t>(k) <
+               static_cast<size_t>(num_sparse_segments))
+        {
+            ++T;
+        }
+
+        grid = static_cast<int>(T);
+    }
+
+    if (grid <= 0)
     {
         return;
     }
+
+    // ========================================================
+    // Shared memory: 1 warp x 3KB compact tile = 3KB
+    // （33 blocks/SM，稀疏 1-warp 路径 0 smem）
+    // ========================================================
 
     constexpr int shared_per_block =
         (
@@ -1876,6 +2432,10 @@ void compute_mttkrp_merged_async(
             static_cast<int>(
                 shared_mem_size)));
 
+    // ========================================================
+    // Sparse views
+    // ========================================================
+
     const uint64_t* coords =
         hybrid.d_sp2_coords[mode];
 
@@ -1891,6 +2451,10 @@ void compute_mttkrp_merged_async(
     const uint32_t* bcn =
         hybrid.d_blk_cnt[mode];
 
+    // ========================================================
+    // Launch
+    // ========================================================
+
     mttkrp_merged_kernel<<<
         grid,
         32,
@@ -1898,7 +2462,7 @@ void compute_mttkrp_merged_async(
         stream>>>(
             d_tiles,
 
-            hybrid.num_dense_tiles,
+            num_dense_blocks,
 
             mode,
 
@@ -1913,7 +2477,7 @@ void compute_mttkrp_merged_async(
 
             num_sparse_segments,
 
-            dense_stride,
+            dense_every,
 
             d_A,
             d_B,
@@ -1933,6 +2497,10 @@ void compute_mttkrp_merged_async(
     CHECK_CUDA(
         cudaGetLastError());
 
+    // ========================================================
+    // Stream ordered free
+    // ========================================================
+
     if (d_tiles != nullptr)
     {
         CHECK_CUDA(
@@ -1941,6 +2509,11 @@ void compute_mttkrp_merged_async(
                 stream));
     }
 }
+
+
+// ============================================================
+// Backward-compatible synchronous dense MTTKRP
+// ============================================================
 
 void compute_dense_mttkrp(
     const HybridCOOTensor& hybrid,
@@ -1964,6 +2537,7 @@ void compute_dense_mttkrp(
             &stream,
             cudaStreamNonBlocking));
 
+
     compute_dense_mttkrp_async(
         hybrid,
 
@@ -1980,9 +2554,11 @@ void compute_dense_mttkrp(
 
         stream);
 
+
     CHECK_CUDA(
         cudaStreamSynchronize(
             stream));
+
 
     CHECK_CUDA(
         cudaStreamDestroy(

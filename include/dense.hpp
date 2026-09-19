@@ -24,7 +24,7 @@ void compute_dense_mttkrp(
     double* d_FtV,
     double* d_FtF,
     int R);
-
+// 合并内核（稠密 tile + 稀疏段单网格，R==32）
 void compute_mttkrp_merged_async(
     const HybridCOOTensor& hybrid,
     int mode,

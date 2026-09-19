@@ -11,6 +11,10 @@
 #include <thrust/device_ptr.h>
 #include <thrust/transform.h>
 
+// ============================================================
+// CUDA device state
+// ============================================================
+
 void debug_cuda_device_state()
 {
 int deviceCount = 0;
@@ -52,7 +56,12 @@ std::cout
     << ")"
     << std::endl;
 
+
 }
+
+// ============================================================
+// Random factor initialization
+// ============================================================
 
 void init_factors_random(
 double** d_factors,
@@ -67,11 +76,13 @@ std::cerr
 << "[Error] Invalid arguments in init_factors_random"
 << std::endl;
 
+
     std::exit(EXIT_FAILURE);
 }
 
 std::mt19937 gen(42);
 
+// BLCO 同款：uniform [0, 1]
 std::uniform_real_distribution<double> dis(0.0, 1.0);
 for (int mode = 0; mode < 3; ++mode)
 {
@@ -108,12 +119,18 @@ for (int mode = 0; mode < 3; ++mode)
     );
 }
 
+
 }
+
+// ============================================================
+// Clamp operation
+// ============================================================
 
 struct ClampOp
 {
 double min_v;
 double max_v;
+
 
 __host__ __device__
 ClampOp(
@@ -133,7 +150,12 @@ double operator()(double x) const
     );
 }
 
+
 };
+
+// ============================================================
+// Clamp factor using Thrust
+// ============================================================
 
 void clamp_factor_thrust(
 double* d_factor,
@@ -146,6 +168,7 @@ size == 0)
 {
 return;
 }
+
 
 thrust::device_ptr<double>
     dev_ptr(d_factor);
@@ -164,7 +187,26 @@ CHECK_CUDA(
     cudaGetLastError()
 );
 
+
 }
+
+// ============================================================
+// RMSE kernel
+//
+// Tensor prediction:
+//
+// X(i,j,k) ~=
+// sum_r lambda[r]
+//            * A(i,r)
+//            * B(j,r)
+//            * C(k,r)
+// ============================================================
+// ============================================================
+// Residual / Sum-of-squares kernels (基于 HybridCOOTensor 视图)
+//
+// 稀疏部分使用 mode-0 排序视图（已按 i 排序，读取合并）；
+// 稠密部分按 tile 处理（每 block 一个 tile）。
+// ============================================================
 
 __device__ __forceinline__
 void block_reduce_add(double my, double* d_out)
@@ -175,7 +217,7 @@ void block_reduce_add(double my, double* d_out)
         my += __shfl_down_sync(0xffffffffu, my, off);
     }
 
-    __shared__ double s_err[8];
+    __shared__ double s_err[8];   // 256 线程 / 32
 
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -205,6 +247,7 @@ void block_reduce_add(double my, double* d_out)
     }
 }
 
+// 稀疏残差平方和（mode-0 排序视图，4 元素/线程）
 __global__
 void residual_sparse_view_kernel(
     const uint64_t* __restrict__ coords,
@@ -242,6 +285,7 @@ void residual_sparse_view_kernel(
         if (idx >= nnz)
             break;
 
+        // 一次性流式数据：__ldcs evict-first，保护因子行常驻 L2
         const uint64_t pc = __ldcs(&coords[idx]);
         const double v = __ldcs(&vals[idx]);
 
@@ -256,6 +300,7 @@ void residual_sparse_view_kernel(
         const double* pb = B + static_cast<size_t>(j) * R;
         const double* pc3 = C + static_cast<size_t>(k) * R;
 
+        // 双累加器：打散 32 级串行 FMA 链，提高指令级并行
         double p0 = 0.0;
         double p1 = 0.0;
 
@@ -296,6 +341,7 @@ void residual_sparse_view_kernel(
     block_reduce_add(my, d_error);
 }
 
+// 稠密 tile 残差平方和（每 block 一个 tile）
 __global__
 void residual_dense_tiles_kernel(
     const DenseTile16* __restrict__ d_tiles,
@@ -334,6 +380,8 @@ void residual_dense_tiles_kernel(
         const int lid =
             t.d_coords[e];
 
+        // TILE_DIM = 16:
+        //   li = lid >> 8, lj = (lid >> 4) & 15, lk = lid & 15
         const int li = lid >> 8;
         const int lj = (lid >> 4) & 15;
         const int lk = lid & 15;
@@ -349,6 +397,7 @@ void residual_dense_tiles_kernel(
         const double* pb = B + static_cast<size_t>(j) * R;
         const double* pc3 = C + static_cast<size_t>(k) * R;
 
+        // 双累加器：打散 32 级串行 FMA 链，提高指令级并行
         double p0 = 0.0;
         double p1 = 0.0;
 
@@ -389,6 +438,7 @@ void residual_dense_tiles_kernel(
     block_reduce_add(my, d_error);
 }
 
+// 稀疏值平方和（用于 ||X||_F）
 __global__
 void sumsq_sparse_view_kernel(
     const double* __restrict__ vals,
@@ -423,6 +473,7 @@ void sumsq_sparse_view_kernel(
     block_reduce_add(my, d_out);
 }
 
+// 稠密 tile 值平方和（用于 ||X||_F）
 __global__
 void sumsq_dense_tiles_kernel(
     const DenseTile16* __restrict__ d_tiles,
@@ -452,6 +503,16 @@ void sumsq_dense_tiles_kernel(
 
     block_reduce_add(my, d_out);
 }
+
+
+// ============================================================
+// 计算 ||X - Xhat||_F^2 与 ||X||_F^2
+//
+// 基于 hybrid 视图（稀疏 mode-0 排序视图 + 稠密 tile 池），
+// 不依赖 COO 设备数组（构建视图后 COO 已被释放）。
+//
+// 该函数同时被 calculate_rmse 与 compute_fit 使用。
+// ============================================================
 
 void compute_residual_and_norm_sq(
     const HybridCOOTensor& h1,
@@ -490,6 +551,7 @@ void compute_residual_and_norm_sq(
     CHECK_CUDA(cudaMemset(d_res, 0, sizeof(double)));
     CHECK_CUDA(cudaMemset(d_x, 0, sizeof(double)));
 
+    // ---- 两份视图分别处理（各用 mode-0 排序视图） ----
     const HybridCOOTensor* hybrids[2] = {&h1, &h2};
 
     for (int hh = 0; hh < 2; ++hh)
@@ -525,6 +587,7 @@ void compute_residual_and_norm_sq(
         CHECK_CUDA(cudaGetLastError());
     }
 
+    // ---- 稠密 tile 池（WMMA 路径下仍存在） ----
     if (h1.num_dense_tiles > 0 && h1.d_dense_coords_pool)
     {
         DenseTile16* d_tiles = nullptr;
@@ -586,6 +649,10 @@ void compute_residual_and_norm_sq(
     cudaFree(d_x);
 }
 
+
+// ============================================================
+// Calculate RMSE
+// ============================================================
 double calculate_rmse(
     const HybridCOOTensor& h1,
     const HybridCOOTensor& h2,

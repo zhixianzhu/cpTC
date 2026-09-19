@@ -13,6 +13,7 @@
 #include "partition.hpp"
 #include "common.hpp"
 #include "sgd.hpp"
+#include "generic.hpp"
 
 // als.cu 内部内核（SGD 路径复用 λ 初始化）
 __global__ void fill_value_kernel(double* x, size_t n, double val);
@@ -76,6 +77,61 @@ int main(int argc, char** argv)
 
     if (max_iters <= 0) max_iters = 1;
     if (R <= 0) R = 1;
+
+    // ============================================================
+    // 2b. 高阶张量（order != 3）路由到通用 N 阶 CP-ALS 路径
+    //
+    //     3 阶保持原 Tensor-Core(WMMA)+FP64 混合管线不变；
+    //     其他阶数（2、4、5、...）走 src/generic.cu 的纯 FP64
+    //     通用路径（任意 N，R <= 32）。
+    // ============================================================
+
+    // GEN_SELFTEST=1: run the N-order dense-path unit test and exit.
+    if (std::getenv("GEN_SELFTEST"))
+        return run_dense_selftest();
+
+    const int file_order = probe_tns_nmodes(filename.c_str());
+
+    if (file_order < 0)
+    {
+        std::cerr << "[Main] cannot determine tensor order of: "
+                  << filename << std::endl;
+        return 1;
+    }
+
+    // ALS_GENERIC_FORCE=1: route order-3 tensors through the generic
+    // N-order path too (diagnostics / cross-validation only).
+    const bool force_generic =
+        (file_order == 3) &&
+        (std::getenv("ALS_GENERIC_FORCE") != nullptr);
+
+    if (file_order != 3 || force_generic)
+    {
+        std::cout << "[Main] order-" << file_order
+                  << " tensor -> generic N-order CP-ALS (pure FP64,"
+                  << " Tensor-Core path is 3-mode specific)"
+                  << std::endl;
+
+        GTensor gt;
+        double load_ms = 0.0;
+        if (!load_tns_generic(filename.c_str(), gt, &load_ms))
+            return 1;
+
+        std::cout << "[Main] Load time = " << load_ms
+                  << " ms | dims = ";
+        for (int m = 0; m < gt.nmodes; ++m)
+            std::cout << (m ? " x " : "") << gt.dims[m];
+        std::cout << " | NNZ = " << gt.nnz << std::endl;
+
+        // GEN_SEED=<n>: factor-init seed for the generic N-order path
+        const unsigned int gen_seed =
+            std::getenv("GEN_SEED")
+                ? (unsigned int)std::atoi(std::getenv("GEN_SEED"))
+                : 42u;
+
+        const int rc = run_generic_cp(gt, max_iters, R, gen_seed);
+        return rc;
+    }
 
     std::cout
         << "[Main] Loading real tensor dataset from file: "

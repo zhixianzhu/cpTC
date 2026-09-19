@@ -10,6 +10,27 @@
 
 using namespace nvcuda;
 
+// ============================================================
+// Row-sorted segmented MTTKRP
+//
+// 数据视图由 build_mttkrp_views()（partition.cu）构建：
+//
+//     d_sp2_coords[mode][pos] : 按目标坐标排序的打包坐标
+//     d_sp2_val[mode][pos]    : 按目标坐标排序的值
+//
+// 每个 CUDA block 处理同一目标行的 MTTKRP_CHUNK 个元素：
+//
+//   - 坐标/值读取完全合并（无 gather）
+//   - 每个线程在寄存器中累加 R 个 rank 的贡献
+//   - block 内用 warp shuffle + shared memory 归约
+//   - 每个 (目标行, rank) 只做一次 atomicAdd
+//
+// 相比旧实现：
+//
+//   原子操作从 nnz * R 降到 blocks * R（约 1000 倍减少），
+//   去掉 64 位 block_id 除法解码与随机 gather。
+// ============================================================
+
 __device__ __forceinline__
 void decode_packed_coords(
     uint64_t pc,
@@ -41,6 +62,19 @@ void decode_packed_coords(
         o1 = j;
     }
 }
+
+
+// ============================================================
+// Row-sorted MTTKRP kernel (template on rank R, rank block RB)
+//
+// 把 R 个 rank 的累加拆成 R/RB 个 rank block：
+//
+//   每个 rank block 只保留 RB 个累加器寄存器，
+//   显著降低寄存器压力、提高占用率（延迟隐藏更好）。
+//
+// 坐标/值会在每个 rank block 重新读取（代价很小），
+// 因子行按 rank block 分段读取，总访存量不变。
+// ============================================================
 
 #ifndef MTTKRP_LB
 #define MTTKRP_LB 5
@@ -77,6 +111,14 @@ mttkrp_rowsorted_kernel(
             acc[r] = 0.0;
         }
 
+        // 每个线程处理 MTTKRP_ITEMS 个连续元素。
+        //
+        // 视图按 (target, o1, o0) 排序：次级字段 o1 相同的元素
+        // 排成连续 run -> F2 行只需从全局读一次，缓存在寄存器
+        // 中供组内所有元素复用；F1（三级字段 o0）按元素读取。
+        //
+        // 按元素读取的因子选择维度较小的矩阵（B/A），
+        // 使其工作集更容易常驻 L2。
         const uint32_t tbase =
             threadIdx.x *
             static_cast<uint32_t>(MTTKRP_ITEMS);
@@ -98,6 +140,8 @@ mttkrp_rowsorted_kernel(
             const uint32_t pos =
                 start + ee;
 
+            // 坐标/值为一次性流式数据：__ldcv 直接取（不缓存），
+            // 让 L2 完全留给反复重读的因子行。
             const uint64_t pc =
                 __ldcv(&d_coords[pos]);
 
@@ -144,6 +188,10 @@ mttkrp_rowsorted_kernel(
                 acc[r] += v * f1[r] * f2reg[r];
             }
         }
+
+        // ----------------------------------------------------
+        // Block reduction for ranks [rb, rb+RB)
+        // ----------------------------------------------------
 
         constexpr int WARPS = MTTKRP_BLOCK / 32;
 
@@ -215,6 +263,11 @@ mttkrp_rowsorted_kernel(
     }
 }
 
+
+// ============================================================
+// Generic fallback (任意 R，逐元素原子累加)
+// ============================================================
+
 __global__ void mttkrp_rowsorted_generic_kernel(
     int mode,
 
@@ -279,6 +332,11 @@ __global__ void mttkrp_rowsorted_generic_kernel(
     }
 }
 
+
+// ============================================================
+// 部分区间回退 kernel
+// ============================================================
+
 __global__ void mttkrp_range_generic_kernel(
     int mode,
 
@@ -339,6 +397,37 @@ __global__ void mttkrp_range_generic_kernel(
     }
 }
 
+
+// ============================================================
+// 协作合并读取内核（BLCO 风格）
+//
+// 每个 block = 128 线程，处理一个目标行 chunk：
+//
+//   - 线程 t 负责 rank r = t % R
+//   - GROUPS = 128 / R 个线程组同时处理 GROUPS 个元素
+//   - 每个元素的因子行由组内 32 个线程协作读取（完全合并）
+//   - 线程 r 累加该行 chunk 内所有元素对 rank r 的贡献
+//   - 跨组 shuffle 归约后，每个 (row, rank) 一次 atomicAdd
+//
+// 相比逐线程散乱读取，因子行读取变为完全合并的 256B 事务，
+// 显著提升有效访存带宽。
+// ============================================================
+
+// ============================================================
+// 稀疏 MTTKRP - WMMA 张量核版本（R == 32，TF32）
+//
+// 论文路线（cuFastTuckerPlusTC）：
+//
+//   C[i,:] = Σ_l v_l · F1[o0_l,:] ⊙ F2[o1_l,:]
+//          = diag(U_iᵀ · V_i)
+//
+// 其中 U[l,r] = v_l·F1[o0_l,r]，V[l,r] = F2[o1_l,r]。
+// 每批 8 个元素（K=8）：组装 A = Uᵀ 的 16×8 块（row-major）
+// 和 B = V 的 8×16 块（col-major），做 16×16×8 TF32 WMMA，
+// 累加器 FP32（分段归约，论文验证精度与 FP64 相当）。
+// 最终对角和写入 FtV。
+// ============================================================
+
 __global__ void mttkrp_rowsorted_wmma32_kernel(
     int mode,
 
@@ -381,6 +470,12 @@ __global__ void mttkrp_rowsorted_wmma32_kernel(
     const uint32_t end =
         start + cnt;
 
+    // 每 warp 独立共享内存区：
+    //   s_a[rb][16][8]  : A = Uᵀ（row-major ld=8）
+    //   s_b[rb][16][8]  : B = V（col-major ld=8）
+    //   s_f1[8][32]     : 本批 8 个元素对应的 F1 因子行（合并读取后复用）
+    //   s_f2[8][32]     : 本批 8 个元素对应的 F2 因子行
+    //   s_meta[2][8]    : o0 / o1
     __shared__ float s_a[NWARP][2][16][8];
     __shared__ float s_b[NWARP][2][16][8];
     __shared__ double s_f1[NWARP][8][32];
@@ -402,7 +497,7 @@ __global__ void mttkrp_rowsorted_wmma32_kernel(
          e0 < end;
          e0 += 8)
     {
-
+        // ---- Step 1: 解码本批 8 个元素（lane 0..7）----
         if (lane < 8 && (e0 + lane) < end)
         {
             const uint64_t pc =
@@ -424,6 +519,9 @@ __global__ void mttkrp_rowsorted_wmma32_kernel(
 
         __syncwarp();
 
+        // ---- Step 2: 合并读取 8 个元素的因子行到共享内存 ----
+        // 每元素一行 32 个 double = 256B；8 行 = 2KB
+        // 32 lane 协作：i 遍历 8*32 = 256，每 lane 8 项
         for (int i = lane; i < 8 * 32; i += 32)
         {
             const int k = i / 32;
@@ -441,6 +539,7 @@ __global__ void mttkrp_rowsorted_wmma32_kernel(
 
         __syncwarp();
 
+        // ---- Step 3: 组装 A/B（纯共享内存，无全局读）----
         const double v =
             (lane < 8 && (e0 + lane) < end)
                 ? __ldcv(&d_sval[e0 + lane])
@@ -457,7 +556,7 @@ __global__ void mttkrp_rowsorted_wmma32_kernel(
                 (k < 8 && (e0 + k) < end)
                     ? (k == (lane < 8 ? lane : -1) ? v : s_f1_w[k][0] * 0.0 + (k == (lane < 8 ? lane : -1) ? 0.0 : 0.0))
                     : 0.0;
-
+            // vk 需要每个 k 的值：直接从全局再读一次 v（8 个元素，开销小）
             const double vk2 =
                 (e0 + k) < end
                     ? __ldcv(&d_sval[e0 + k])
@@ -472,6 +571,7 @@ __global__ void mttkrp_rowsorted_wmma32_kernel(
 
         __syncwarp();
 
+        // ---- Step 4: 张量核 ----
         for (int rb = 0; rb < 2; ++rb)
         {
             wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32,
@@ -510,6 +610,7 @@ __global__ void mttkrp_rowsorted_wmma32_kernel(
     }
 }
 
+
 template <int R>
 __global__ void mttkrp_rowsorted_coalesced_kernel(
     int mode,
@@ -545,7 +646,7 @@ __global__ void mttkrp_rowsorted_coalesced_kernel(
          e < end;
          e += static_cast<uint32_t>(GROUPS))
     {
-
+        // 组内所有线程读同一个元素（广播），因子行合并读取
         const uint64_t pc = __ldcv(&d_coords[e]);
         const double v = __ldcv(&d_sval[e]);
 
@@ -568,9 +669,12 @@ __global__ void mttkrp_rowsorted_coalesced_kernel(
             F2[static_cast<size_t>(o1) * R + r];
     }
 
+    // 跨 warp 归约（shfl 只能在同一 warp 内）：
+    // 每个线程把自己的部分和写入 s_red[warp][rank]，
+    // 然后每个 warp 的 lane 处理其 32 个 rank 的跨 warp 总和。
     constexpr int WARPS = THREADS / 32;
 
-    __shared__ double s_red[WARPS][R];
+    __shared__ double s_red[WARPS][R];   // R <= 128（缩小共享内存，便于与 WMMA 内核共驻）
 
     for (int i = threadIdx.x; i < WARPS * R; i += THREADS)
     {
@@ -605,6 +709,10 @@ __global__ void mttkrp_rowsorted_coalesced_kernel(
         }
     }
 }
+
+// ============================================================
+// Host launcher
+// ============================================================
 
 static void launch_mttkrp_rowsorted(
     const HybridCOOTensor& hybrid,
@@ -677,7 +785,11 @@ static void launch_mttkrp_rowsorted(
             break;
 
         case 32:
-
+            // 张量核变体（ALS_SPARSE_WMMA=1）实测：TF32+FP32 累加精度合格
+            // （fit 0.2996 保持），但性能 78~121ms 慢于 FP64 59.8ms——
+            // Nell-2 每元素因子行（512B）随机变化，组装成本 > 张量核收益。
+            // 论文 cuFastTuckerPlusTC 能快是因为每样本行共享因子矩阵
+            // （读一次复用 M 行），与我们的逐元素行段结构不同。
             mttkrp_rowsorted_coalesced_kernel<32><<<gx, 128, 0, stream>>>(
                 mode, coords, sval, bro, bst, bcn, F1, F2, d_FtV);
             break;
@@ -700,6 +812,11 @@ static void launch_mttkrp_rowsorted(
 
     CHECK_CUDA(cudaGetLastError());
 }
+
+
+// ============================================================
+// Sparse MTTKRP - Async（完整范围）
+// ============================================================
 
 void compute_sparse_mttkrp_async(
     const HybridCOOTensor& hybrid,
@@ -735,6 +852,11 @@ void compute_sparse_mttkrp_async(
         R,
         stream);
 }
+
+
+// ============================================================
+// Sparse MTTKRP - Async（部分范围回退）
+// ============================================================
 
 void compute_sparse_mttkrp_async(
     const HybridCOOTensor& hybrid,
@@ -775,6 +897,7 @@ void compute_sparse_mttkrp_async(
             hybrid.sparse_nnz -
                 start_idx);
 
+    // 完整范围走 row-sorted 快路径
     if (start_idx == 0 &&
         count == hybrid.sparse_nnz)
     {
@@ -791,6 +914,7 @@ void compute_sparse_mttkrp_async(
         return;
     }
 
+    // 部分范围：通用 kernel（每个元素每 rank 一次 atomicAdd）
     const double* F1 = nullptr;
     const double* F2 = nullptr;
 
@@ -839,6 +963,11 @@ void compute_sparse_mttkrp_async(
 
     CHECK_CUDA(cudaGetLastError());
 }
+
+
+// ============================================================
+// Backward-compatible synchronous interface
+// ============================================================
 
 void compute_sparse_mttkrp(
     const HybridCOOTensor& hybrid,

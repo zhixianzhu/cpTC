@@ -8,6 +8,16 @@
 #include <cstddef>
 #include <iostream>
 
+// ============================================================
+// Kernel
+//
+// pred = sum_r lambda[r]
+//              * A[i,r]
+//              * B[j,r]
+//              * C[k,r]
+//
+// 如果 lambda == nullptr，则认为 lambda[r] = 1
+// ============================================================
 __global__
 void compute_residual_kernel(
     const double* val,
@@ -27,6 +37,22 @@ void compute_residual_kernel(
 
     double* d_res_norm_sq);
 
+// ============================================================
+// Compute fit
+//
+// fit = 1 - ||X - X_hat||_F / ||X||_F
+//
+// X_hat =
+//     sum_r lambda[r]
+//              * A[:,r]
+//              * B[:,r]
+//              * C[:,r]
+//
+// lambda == nullptr 时：lambda[r] = 1
+//
+// 注意：基于 HybridCOOTensor 的 MTTKRP 视图计算
+//（COO 设备数组在视图构建后会被释放）。
+// ============================================================
 double compute_fit(
     const HybridCOOTensor& h1,
     const HybridCOOTensor& h2,
@@ -36,6 +62,9 @@ double compute_fit(
     const double* d_lambda,
     int R);
 
+// ============================================================
+// Fit report
+// ============================================================
 void print_fit_report(
     const HybridCOOTensor& h1,
     const HybridCOOTensor& h2,
@@ -47,4 +76,4 @@ void print_fit_report(
     double rmse,
     const char* tag = "");
 
-#endif
+#endif // COMPUTE_FIT_HPP

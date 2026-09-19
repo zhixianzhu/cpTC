@@ -11,7 +11,7 @@
 #     /home/zzx/magma        (MAGMA library, used for LU fallback)
 # ============================================================
 set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 NVCC=/usr/local/cuda-12.6/bin/nvcc
 INC="-I include -I /home/zzx/magma/build/include -I /home/zzx/magma/include"
@@ -23,8 +23,8 @@ echo "==> Compiling (-O3, sm_89) ..."
 $NVCC -O3 -gencode arch=compute_89,code=sm_89 -ccbin gcc \
     $INC -o Release_opt/cptc_opt \
     src/als.cu src/cadr.cu src/common.cu src/compute_fit.cu \
-    src/dense.cu src/main.cu src/partition.cu src/solver.cu \
-    src/sparse.cu src/tensor.cu \
+    src/dense.cu src/generic.cu src/main.cu src/partition.cu \
+    src/sgd.cu src/solver.cu src/sparse.cu src/tensor.cu \
     --cudart=static $LIBS
 
 echo "==> Done: Release_opt/cptc_opt"
